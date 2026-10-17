@@ -91,3 +91,56 @@ def test_train_steps_on_one_batch_lower_the_world_model_losses():
 
     assert last["loss/rec"] < 0.8 * first["loss/rec"]
     assert last["loss/con"] < 0.8 * first["loss/con"]
+
+
+N = 3  # The number of environments.
+
+
+def env_step(is_first):
+    """One step of N environments, in the format of `BatchEnv.step`."""
+    rng = np.random.default_rng(0)
+    return {
+        "position": rng.normal(size=(N, 3)).astype(np.float32),
+        "velocity": rng.normal(size=(N, 2)).astype(np.float32),
+        "reward": np.zeros(N, np.float32),
+        "is_first": np.full(N, is_first),
+        "is_last": np.zeros(N, bool),
+        "is_terminal": np.zeros(N, bool),
+    }
+
+
+def test_policy_gives_one_action_for_each_environment():
+    agent = make_agent()
+
+    action, _ = agent.policy(
+        agent.initial_policy_state(N), env_step(True), jax.random.key(1)
+    )
+
+    assert action.shape == (N, A)
+    assert jnp.isfinite(action).all()
+
+
+def test_policy_samples_different_actions_with_different_keys():
+    agent = make_agent()
+    state = agent.initial_policy_state(N)
+
+    action_1, _ = agent.policy(state, env_step(True), jax.random.key(1))
+    action_2, _ = agent.policy(state, env_step(True), jax.random.key(2))
+    action_3, _ = agent.policy(state, env_step(True), jax.random.key(1))
+
+    assert not jnp.allclose(action_1, action_2)
+    np.testing.assert_array_equal(action_1, action_3)
+
+
+def test_policy_forgets_the_last_episode_at_is_first():
+    agent = make_agent()
+    state = agent.initial_policy_state(N)
+    for key in jax.random.split(jax.random.key(1), 5):
+        _, state = agent.policy(state, env_step(False), key)
+
+    after_episode, _ = agent.policy(state, env_step(True), jax.random.key(2))
+    fresh, _ = agent.policy(
+        agent.initial_policy_state(N), env_step(True), jax.random.key(2)
+    )
+
+    np.testing.assert_allclose(after_episode, fresh, atol=1e-6)

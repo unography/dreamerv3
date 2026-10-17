@@ -10,6 +10,10 @@ One training step does these operations on a batch of replay sequences:
    gradients keep the losses apart: the world model learns only from its own
    losses.
 4. The slow critic moves toward the critic.
+
+In the environment, the agent acts with `policy`. The policy keeps the RSSM
+state of each environment, updates it with each observation, and samples an
+action from the actor.
 """
 
 import jax
@@ -25,7 +29,11 @@ from dreamer.actor_critic import (
 )
 from dreamer.config import Config
 from dreamer.optim import make_optimizer
+from dreamer.rssm import State
 from dreamer.world_model import TwoHotHead, WorldModel
+
+# The state of the policy: the RSSM state and the last action [N, A].
+PolicyState = tuple[State, jax.Array]
 
 # The optimizer trains all weights except the weights of the slow critic, which
 # follows the critic.
@@ -42,6 +50,7 @@ class Agent(nnx.Module):
         rngs: nnx.Rngs,
     ):
         c = self.config = config
+        self.action_size = action_size
         self.world_model = WorldModel(
             obs_shapes,
             action_size,
@@ -72,6 +81,30 @@ class Agent(nnx.Module):
             make_optimizer(c.lr, c.agc, c.eps, c.beta1, c.beta2, c.warmup),
             wrt=TRAINABLE,
         )
+
+    def initial_policy_state(self, num_envs: int) -> PolicyState:
+        initial = self.world_model.rssm.initial(num_envs)
+        return initial, jnp.zeros((num_envs, self.action_size))
+
+    @nnx.jit(graph=False)
+    def policy(
+        self, state: PolicyState, obs: dict[str, jax.Array], key: jax.Array
+    ) -> tuple[jax.Array, PolicyState]:
+        """Chooses the actions [N, A] for one step of N environments.
+
+        The world model updates its state with the new observation. Then the
+        actor samples an action from this state. The samples are random, so
+        the agent explores.
+        """
+        rssm_state, prev_action = state
+        obs_key, action_key = jax.random.split(key)
+        world_model = self.world_model
+        token = world_model.encoder({name: obs[name] for name in world_model.obs_keys})
+        rssm_state, _ = world_model.rssm.obs_step(
+            rssm_state, prev_action, token, obs["is_first"], obs_key
+        )
+        action = self.actor(rssm_state.features()).sample(action_key)
+        return action, (rssm_state, action)
 
     # In tree mode (graph=False), `nnx.jit` handles the agent as a plain pytree.
     # The default graph mode supports shared variables, but then each call
