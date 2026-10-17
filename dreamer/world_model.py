@@ -8,6 +8,9 @@ these parts:
 - The decoder reconstructs the observation from the model state. This loss
   makes the state hold the information of the observations.
 
+- The reward head predicts the reward of each step.
+- The continue head predicts if the episode continues after each step.
+
 The model state is the input of all heads. Thus the agent can imagine the
 future with the RSSM prior, and get the predictions of the heads for these
 imagined states.
@@ -20,7 +23,9 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from dreamer.layers import MLP
+from dreamer.distributions import Bernoulli, TwoHot, symexp_bins
+from dreamer.layers import MLP, scaled_init
+from dreamer.rssm import RSSM, State
 from dreamer.symlog import symlog
 
 
@@ -82,3 +87,137 @@ def symlog_mse(prediction: jax.Array, target: jax.Array) -> jax.Array:
     values do not dominate the loss.
     """
     return jnp.square(prediction - symlog(target)).sum(-1)
+
+
+class TwoHotHead(nnx.Module):
+    """An MLP with a two-hot output. The reward head and the critic use it.
+
+    The output layer starts with zero weights, so the head predicts exactly
+    zero at the start of training. Thus the first predictions of rewards and
+    values are not large random numbers.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        *,
+        units: int = 64,
+        layers: int = 1,
+        bins: int = 255,
+        rngs: nnx.Rngs,
+    ):
+        self.bins = bins
+        self.mlp = MLP(in_features, units, layers, rngs=rngs)
+        self.out = nnx.Linear(units, bins, kernel_init=scaled_init(0.0), rngs=rngs)
+
+    def __call__(self, features: jax.Array) -> TwoHot:
+        return TwoHot(self.out(self.mlp(features)), symexp_bins(self.bins))
+
+
+class ContinueHead(nnx.Module):
+    """An MLP that predicts if the episode continues after a step."""
+
+    def __init__(
+        self, in_features: int, *, units: int = 64, layers: int = 1, rngs: nnx.Rngs
+    ):
+        self.mlp = MLP(in_features, units, layers, rngs=rngs)
+        self.out = nnx.Linear(units, 1, rngs=rngs)
+
+    def __call__(self, features: jax.Array) -> Bernoulli:
+        return Bernoulli(self.out(self.mlp(features))[..., 0])
+
+
+def continue_target(is_terminal: jax.Array, horizon: float = 333) -> jax.Array:
+    """The target of the continue head: the discount factor of each step.
+
+    The target is 1 - 1 / horizon for steps that continue, and zero for
+    terminal steps. Thus the continue head learns the discount factor and the
+    episode ends together. The imagined returns then need no other discount.
+    """
+    return (1 - is_terminal.astype(jnp.float32)) * (1 - 1 / horizon)
+
+
+class WorldModel(nnx.Module):
+    """The encoder, the RSSM, the decoder, and the reward and continue heads.
+
+    The size arguments have the defaults of the smallest DreamerV3 model, which
+    the reference uses for DMC tasks with proprioceptive observations.
+    """
+
+    def __init__(
+        self,
+        obs_shapes: dict[str, tuple[int]],
+        action_size: int,
+        *,
+        deter: int = 512,
+        hidden: int = 64,
+        stoch: int = 32,
+        classes: int = 4,
+        blocks: int = 8,
+        units: int = 64,
+        unimix: float = 0.01,
+        rngs: nnx.Rngs,
+    ):
+        self.obs_keys = sorted(obs_shapes)
+        feature_size = deter + stoch * classes
+        self.encoder = Encoder(obs_shapes, units=units, layers=3, rngs=rngs)
+        self.rssm = RSSM(
+            units,
+            action_size,
+            deter=deter,
+            hidden=hidden,
+            stoch=stoch,
+            classes=classes,
+            blocks=blocks,
+            unimix=unimix,
+            rngs=rngs,
+        )
+        self.decoder = Decoder(
+            feature_size, obs_shapes, units=units, layers=3, rngs=rngs
+        )
+        self.reward = TwoHotHead(feature_size, units=units, layers=1, rngs=rngs)
+        self.cont = ContinueHead(feature_size, units=units, layers=1, rngs=rngs)
+
+    def loss(
+        self,
+        start: State,
+        prev_actions: jax.Array,
+        data: dict[str, jax.Array],
+        key: jax.Array,
+        *,
+        horizon: float = 333,
+        free_nats: float = 1.0,
+    ) -> tuple[dict[str, jax.Array], State]:
+        """Gives the world model losses on a batch of replay sequences.
+
+        Args:
+            start: the state before the sequences. Shapes [B, ...].
+            prev_actions: the action before each step [B, T, A].
+            data: the observations, rewards, and flags of the steps [B, T, ...].
+            key: the random key for the samples of z.
+
+        Returns:
+            The losses, each [B, T], and the posterior states [B, T, ...]:
+
+            - `dyn`, `rep`: the KL losses of the RSSM.
+            - `rec`: the reconstruction loss of the observations.
+            - `rew`: the reward loss.
+            - `con`: the continue loss.
+        """
+        tokens = self.encoder({name: data[name] for name in self.obs_keys})
+        states, post_logits = self.rssm.observe(
+            start, prev_actions, tokens, data["is_first"], key
+        )
+        dyn, rep = self.rssm.kl_losses(states.deter, post_logits, free_nats)
+        features = states.features()
+        recons = self.decoder(features)
+        losses = {
+            "dyn": dyn,
+            "rep": rep,
+            "rec": sum(symlog_mse(recons[k], data[k]) for k in self.obs_keys),
+            "rew": self.reward(features).loss(data["reward"]),
+            "con": -self.cont(features).log_prob(
+                continue_target(data["is_terminal"], horizon)
+            ),
+        }
+        return losses, states
