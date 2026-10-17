@@ -23,6 +23,7 @@ Reference: section "World model learning" of the DreamerV3 paper, and
 `dreamerv3/rssm.py` of the reference implementation.
 """
 
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -145,6 +146,71 @@ class RSSM(nnx.Module):
         stoch = self.dist(logits).sample(key)
         return State(deter, stoch), logits
 
+    def observe(
+        self,
+        state: State,
+        prev_actions: jax.Array,
+        tokens: jax.Array,
+        is_first: jax.Array,
+        key: jax.Array,
+    ) -> tuple[State, jax.Array]:
+        """Runs `obs_step` along a sequence of observations.
+
+        Args:
+            state: the state before the sequence. Shapes [B, ...].
+            prev_actions: [B, T, A]. Entry t is the action a_t-1 before step t.
+            tokens: the encoded observations [B, T, E].
+            is_first: [B, T].
+            key: the random key for the samples of z.
+
+        Returns:
+            The states [B, T, ...] and the posterior logits [B, T, S, C].
+        """
+
+        def step(state, inputs):
+            action, token, first, key = inputs
+            state, logits = self.obs_step(state, action, token, first, key)
+            return state, (state, logits)
+
+        inputs = _swap_batch_and_time((prev_actions, tokens, is_first))
+        keys = jax.random.split(key, tokens.shape[1])
+        _, outputs = jax.lax.scan(step, state, (*inputs, keys))
+        return _swap_batch_and_time(outputs)
+
+    def imagine(
+        self,
+        start: State,
+        policy: Callable[[State, jax.Array], jax.Array],
+        horizon: int,
+        key: jax.Array,
+    ) -> tuple[State, jax.Array]:
+        """Imagines trajectories with the prior and a policy.
+
+        Args:
+            start: the start states. Shapes [B, ...].
+            policy: a function (state, key) -> action [B, A].
+            horizon: the number H of imagined steps.
+            key: the random key for the actions and the samples of z.
+
+        Returns:
+            The states [B, H + 1, ...], which begin with the start states, and
+            the actions [B, H]. Action t moves the model from state t to
+            state t + 1.
+        """
+
+        def step(state, key):
+            policy_key, step_key = jax.random.split(key)
+            action = policy(state, policy_key)
+            state, _ = self.img_step(state, action, step_key)
+            return state, (state, action)
+
+        keys = jax.random.split(key, horizon)
+        _, (states, actions) = jax.lax.scan(step, start, keys)
+        states = jax.tree.map(
+            lambda first, rest: jnp.concatenate([first[None], rest]), start, states
+        )
+        return _swap_batch_and_time((states, actions))
+
     def recurrent(self, state: State, action: jax.Array) -> jax.Array:
         """Computes the next deterministic state h_t = f(h_t-1, z_t-1, a_t-1)."""
         deter = state.deter  # [B, D]
@@ -194,3 +260,9 @@ class RSSM(nnx.Module):
 def _expand(mask: jax.Array, x: jax.Array) -> jax.Array:
     """Adds trailing axes to a mask [B] so that it broadcasts against x."""
     return mask.reshape(mask.shape + (1,) * (x.ndim - mask.ndim)).astype(x.dtype)
+
+
+def _swap_batch_and_time(tree):
+    """Swaps axes 0 and 1. The model uses [B, T] arrays, but `jax.lax.scan`
+    loops over axis 0, so the scans use [T, B] arrays."""
+    return jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), tree)
