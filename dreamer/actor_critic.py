@@ -10,6 +10,7 @@ paper.
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 
 def lambda_return(
@@ -53,3 +54,46 @@ def lambda_return(
     inputs = [x[:, 1:].T for x in (reward, value, discount, lam)]
     _, returns = jax.lax.scan(step, value[:, -1], inputs, reverse=True)
     return returns.T
+
+
+class RunningStat(nnx.Variable):
+    """A statistic that the training updates directly, not the optimizer."""
+
+
+class ReturnNorm(nnx.Module):
+    """Gives the scale of the returns, for the normalization of advantages.
+
+    The scale is S = max(limit, P_high - P_low), where P_low and P_high are
+    percentiles of the returns. Moving averages smooth the two percentiles
+    across updates.
+
+    - For large returns, S is the range of the returns. Thus the size of the
+      actor gradient does not depend on the reward scale of the task.
+    - For small returns, for example with sparse rewards, S is the limit 1.
+      Thus the normalization does not make the noise of small returns large.
+
+    Percentiles ignore rare outliers, so one large return does not change S
+    much.
+    """
+
+    def __init__(
+        self,
+        rate: float = 0.01,
+        limit: float = 1.0,
+        low: float = 5.0,
+        high: float = 95.0,
+    ):
+        self.rate = rate
+        self.limit = limit
+        self.percentiles = (low, high)
+        self.low = RunningStat(jnp.zeros(()))
+        self.high = RunningStat(jnp.zeros(()))
+
+    def update(self, returns: jax.Array) -> None:
+        returns = jax.lax.stop_gradient(returns)
+        low, high = jnp.percentile(returns, jnp.array(self.percentiles))
+        self.low[...] = (1 - self.rate) * self.low[...] + self.rate * low
+        self.high[...] = (1 - self.rate) * self.high[...] + self.rate * high
+
+    def scale(self) -> jax.Array:
+        return jnp.maximum(self.limit, self.high[...] - self.low[...])
