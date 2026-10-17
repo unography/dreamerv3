@@ -5,6 +5,7 @@ description = "A small DreamerV3 in JAX and Flax NNX, written to teach."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "dm-control>=1.0.49",
     "flax>=0.12.10",
     "jax>=0.11.2",
     "numpy>=2.1",
@@ -23,6 +24,10 @@ packages = ["dreamer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    # dm_control sets array shapes in place, which NumPy 2.5 deprecates.
+    "ignore:Setting the shape on a NumPy array:DeprecationWarning:dm_control",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
