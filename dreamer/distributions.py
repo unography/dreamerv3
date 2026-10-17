@@ -115,3 +115,59 @@ class OneHotCategorical:
     def kl(self, other: "OneHotCategorical") -> jax.Array:
         """The KL divergence KL(self || other)."""
         return (self.probs * (self.log_probs - other.log_probs)).sum(-1)
+
+
+class Normal:
+    """An independent normal distribution for each action dimension."""
+
+    def __init__(self, mean: jax.Array, std: jax.Array):
+        self.mean = mean
+        self.std = std
+
+    def sample(self, key: jax.Array) -> jax.Array:
+        return self.mean + self.std * jax.random.normal(key, self.mean.shape)
+
+    def log_prob(self, x: jax.Array) -> jax.Array:
+        z = (x - self.mean) / self.std
+        return -0.5 * jnp.square(z) - jnp.log(self.std) - 0.5 * jnp.log(2 * jnp.pi)
+
+    def entropy(self) -> jax.Array:
+        return 0.5 * jnp.log(2 * jnp.pi * jnp.e * jnp.square(self.std))
+
+
+def bounded_normal(
+    mean: jax.Array, std: jax.Array, min_std: float = 0.1, max_std: float = 1.0
+) -> Normal:
+    """Makes the DreamerV3 policy distribution for continuous actions.
+
+    The inputs are raw network outputs. A tanh puts the mean into [-1, 1], the
+    action range. A sigmoid puts the standard deviation into the range
+    [min_std, max_std]. The offset of 2 in the sigmoid moves the initial
+    standard deviation near the maximum, so the policy explores much at the
+    start of training.
+
+    The samples are not bounded. The environment clips them to [-1, 1].
+    """
+    std = (max_std - min_std) * jax.nn.sigmoid(std + 2.0) + min_std
+    return Normal(jnp.tanh(mean), std)
+
+
+class Bernoulli:
+    """A distribution over 0 and 1, with the probability of 1 from a logit."""
+
+    def __init__(self, logit: jax.Array):
+        self.logit = logit
+
+    def prob(self) -> jax.Array:
+        """The probability of 1."""
+        return jax.nn.sigmoid(self.logit)
+
+    def log_prob(self, x: jax.Array) -> jax.Array:
+        """The log probability of x.
+
+        A value of x between 0 and 1 is a soft target. The result is then the
+        negative cross-entropy between x and the predicted probability.
+        """
+        log_p1 = jax.nn.log_sigmoid(self.logit)
+        log_p0 = jax.nn.log_sigmoid(-self.logit)
+        return x * log_p1 + (1 - x) * log_p0
