@@ -7,7 +7,11 @@ and gives sequences of a fixed length.
 A sequence can contain the end of one episode and the start of the next one.
 The `is_first` flag marks the start, and the world model resets its state at
 that step.
+
+Reference: appendix "Experience replay" of the DreamerV3 paper.
 """
+
+import collections
 
 import numpy as np
 
@@ -22,9 +26,21 @@ class Replay:
 
     Each environment stream gives one sequence for each start position. The
     buffer samples all of these sequences with equal probability.
+
+    With `online`, the buffer also keeps a queue of the new sequences. Each
+    environment adds a sequence to the queue after each `length` new steps, so
+    the queued sequences do not overlap. A batch takes the queued sequences
+    first. Thus the agent trains on all new data at least once, and soon.
     """
 
-    def __init__(self, capacity: int, num_envs: int, length: int, seed: int = 0):
+    def __init__(
+        self,
+        capacity: int,
+        num_envs: int,
+        length: int,
+        seed: int = 0,
+        online: bool = False,
+    ):
         self.num_envs = num_envs
         self.length = length
         self.slots = capacity // num_envs
@@ -32,6 +48,8 @@ class Replay:
         self.count = 0  # The number of steps that each environment added.
         self.data: dict[str, np.ndarray] = {}  # Arrays [num_envs, slots, ...].
         self.rng = np.random.default_rng(seed)
+        self.online = online
+        self.queue: collections.deque[tuple[int, int]] = collections.deque()
 
     def __len__(self) -> int:
         """The number of different sequences that the buffer can give."""
@@ -50,13 +68,25 @@ class Replay:
         for key, value in step.items():
             self.data[key][:, slot] = value
         self.count += 1
+        if self.online and self.count % self.length == 0:
+            start = self.count - self.length
+            self.queue.extend((env, start) for env in range(self.num_envs))
 
     def sample(self, batch_size: int) -> dict[str, np.ndarray]:
         """Gives a batch of sequences [B, T, ...]."""
         assert len(self) > 0, "The buffer does not contain a full sequence."
         oldest = max(0, self.count - self.slots)
-        env = self.rng.integers(0, self.num_envs, batch_size)
-        start = self.rng.integers(oldest, self.count - self.length + 1, batch_size)
+        queued = []
+        while self.queue and len(queued) < batch_size:
+            env, start = self.queue.popleft()
+            if start >= oldest:  # The buffer still holds this sequence.
+                queued.append((env, start))
+        uniform = batch_size - len(queued)
+        env = self.rng.integers(0, self.num_envs, uniform)
+        start = self.rng.integers(oldest, self.count - self.length + 1, uniform)
+        if queued:
+            env = np.concatenate([[e for e, _ in queued], env])
+            start = np.concatenate([[s for _, s in queued], start])
         slots = (start[:, None] + np.arange(self.length)) % self.slots
         batch = {key: value[env[:, None], slots] for key, value in self.data.items()}
         # The model does not know the state before the sequence. Thus it starts

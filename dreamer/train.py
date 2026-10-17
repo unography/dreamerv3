@@ -42,6 +42,7 @@ class Args:
     batch_size: int = 16
     batch_length: int = 64
     replay_size: int = 5_000_000
+    replay_online: bool = True  # Train on each new sequence at least once.
     log_every: int = 10_000  # The number of environment steps between logs.
     agent: Config = Config()
 
@@ -127,7 +128,11 @@ def train(args: Args) -> None:
         envs.obs_shapes, envs.action_size, args.agent, rngs=nnx.Rngs(args.seed)
     )
     replay = Replay(
-        min(args.replay_size, args.steps), args.envs, args.batch_length, args.seed
+        min(args.replay_size, args.steps),
+        args.envs,
+        args.batch_length,
+        args.seed,
+        online=args.replay_online,
     )
     batch_steps = args.batch_size * args.batch_length
     should_train = Ratio(args.train_ratio / batch_steps)

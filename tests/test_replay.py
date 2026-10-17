@@ -78,3 +78,26 @@ def test_each_sequence_starts_with_is_first():
     np.testing.assert_array_equal(batch["is_first"][:, 1:], expected)
     # The buffer itself does not change.
     assert replay.data["is_first"].sum() == 5
+
+
+def test_online_queue_gives_each_new_sequence_first():
+    replay = Replay(capacity=100, num_envs=2, length=5, online=True)
+    add_steps(replay, 10)
+
+    first = replay.sample(batch_size=3)["id"][:, 0]
+    second = replay.sample(batch_size=3)["id"][:, 0]
+
+    # Each environment queued the sequences that start at time 0 and 5.
+    assert first.tolist() == [0, 1000, 5]
+    assert second[0] == 1005
+
+
+def test_online_queue_gives_every_new_step_to_training():
+    replay = Replay(capacity=1000, num_envs=2, length=5, online=True)
+    seen = set()
+    for _ in range(20):
+        add_steps(replay, 5)
+        seen.update(replay.sample(batch_size=4)["id"].flatten().tolist())
+
+    all_steps = {1000 * env + time for env in range(2) for time in range(100)}
+    assert seen == all_steps
