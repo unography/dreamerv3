@@ -211,6 +211,40 @@ class RSSM(nnx.Module):
         )
         return _swap_batch_and_time((states, actions))
 
+    def kl_losses(
+        self, deter: jax.Array, post_logits: jax.Array, free_nats: float = 1.0
+    ) -> tuple[jax.Array, jax.Array]:
+        """Gives the two KL losses that train the prior and the posterior.
+
+        Both losses are the KL divergence KL(q || p) between the posterior q
+        and the prior p. Each loss stops the gradient on a different side:
+
+        - The dynamics loss KL(sg(q) || p) trains the prior to predict the
+          posterior.
+        - The representation loss KL(q || sg(p)) trains the posterior to stay
+          predictable. The world model gives it a smaller scale, so the
+          posterior keeps the information about the observations.
+
+        Free bits: each loss has a minimum of `free_nats`. Below this value,
+        the loss is constant and has no gradient. Thus the model does not try
+        to make good predictions perfect, and the other losses get the
+        capacity of the model.
+
+        Args:
+            deter: the deterministic states h [B, T, D] from `observe`.
+            post_logits: the posterior logits [B, T, S, C] from `observe`.
+            free_nats: the minimum of each loss.
+
+        Returns:
+            The dynamics loss and the representation loss, each [B, T]. Each
+            loss is a sum over the S categorical variables.
+        """
+        sg = jax.lax.stop_gradient
+        prior_logits = self.prior(deter)
+        dyn = self.dist(sg(post_logits)).kl(self.dist(prior_logits)).sum(-1)
+        rep = self.dist(post_logits).kl(self.dist(sg(prior_logits))).sum(-1)
+        return jnp.maximum(dyn, free_nats), jnp.maximum(rep, free_nats)
+
     def recurrent(self, state: State, action: jax.Array) -> jax.Array:
         """Computes the next deterministic state h_t = f(h_t-1, z_t-1, a_t-1)."""
         deter = state.deter  # [B, D]
