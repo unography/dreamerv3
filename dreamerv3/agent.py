@@ -266,7 +266,7 @@ class Agent(embodied.jax.Agent):
           lossfn = lambda data, carry: self.loss(
               carry, obs, prevact, training=False)[1][2]['losses'][key].mean()
           grad = nj.grad(lossfn, self.modules)(data, carry)[-1]
-          metrics[f'gradnorm/{key}'] = optax.global_norm(grad)
+          metrics[f'gradnorm/{key}'] = optax.tree.norm(grad)
         except KeyError:
           print(f'Skipping gradnorm summary for missing loss: {key}')
 

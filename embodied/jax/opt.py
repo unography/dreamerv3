@@ -61,7 +61,7 @@ class Optimizer(nj.Module):
     updates, new_state = self.opt.update(grads, state.read(), params)
     nj.context().update(optax.apply_updates(params, updates))
     state.write(new_state)
-    grad_norm = optax.global_norm(grads)
+    grad_norm = optax.tree.norm(grads)
     if self.scaling:
       self._update_scale(grads, jnp.isfinite(grad_norm))
       grad_norm = jnp.where(jnp.isfinite(grad_norm), grad_norm, jnp.nan)

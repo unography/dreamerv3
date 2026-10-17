@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import ninjax as nj
 
 from . import internal
+from . import nets
 
 sg = jax.lax.stop_gradient
 f32 = jnp.float32
@@ -231,3 +232,77 @@ def layer_scan(fn, scope, count, inp, *args, **kwargs):
     nj.context().update(changing_outer)
 
   return (out, *other) if len(other) else out
+
+
+def tap_scan(fun, carry, xs, length=None, unroll=1, axis=0):
+  # Like nj.scan() but computes the gradients of the Linear and BlockLinear
+  # layers inside the loop body with one contraction over all time steps after
+  # the reverse scan, instead of accumulating them at every step.
+  if nj.creating():
+    return nj.scan(fun, carry, xs, length, unroll=unroll, axis=axis)
+  if axis:
+    xs = jax.tree.map(lambda x: x.swapaxes(0, axis), xs)
+  length = length or len(jax.tree.leaves(xs)[0])
+  fun = nj.pure(fun, nested=True)
+  ctx = nj.context()
+  with nets.Tape() as tape:
+    _, _, accessed, modified, _ = fun(
+        dict(ctx), jax.tree.map(lambda x: x, carry),
+        jax.tree.map(lambda x: x[0], xs), ignore=True, track=True,
+        seed=nj.seed(None, True))
+  assert not modified, modified
+  specs = tape.specs
+  heavy = {f'{p}/{n}' for p in specs for n in ('kernel', 'bias')}
+  rest = {k: v for k, v in ctx.items() if k in accessed and k not in heavy}
+  heavy = {k: v for k, v in ctx.items() if k in accessed and k in heavy}
+  dtypes = {k: v.dtype for k, v in heavy.items()}
+  seeds = nj.seed(length, True)
+
+  def run(heavy, rest, carry, xs, seeds, taps=None):
+    def body(carry, inp):
+      x, seed, tap = inp
+      with nets.Tape(tap) as tape:
+        _, (carry, y) = fun(
+            {**heavy, **rest}, carry, x, create=False, seed=seed)
+      return carry, (y, tape.inps if taps is not None else {})
+    carry, (ys, inps) = jax.lax.scan(
+        body, carry, (xs, seeds, taps), length, unroll=unroll)
+    return (carry, ys), inps
+
+  def fwd(heavy, rest, carry, xs, seeds):
+    taps = {
+        k: jnp.zeros((length, *s.shape), s.dtype)
+        for k, (s, _) in specs.items()}
+    f = lambda *a: run(heavy, *a[:3], seeds, a[3])
+    out, vjp, inps = jax.vjp(f, rest, carry, xs, taps, has_aux=True)
+    return out, (vjp, inps)
+
+  def bwd(res, dout):
+    vjp, inps = res
+    drest, dcarry, dxs, dtaps = vjp(dout)
+    dheavy = {}
+    for key, dtype in dtypes.items():
+      path, name = key.rsplit('/', 1)
+      dy = dtaps[path]
+      if name == 'kernel':
+        blocks = specs[path][1]
+        x = inps[path]
+        if blocks:
+          x = x.reshape((-1, *x.shape[-2:]))
+          dy = dy.reshape((-1, blocks, dy.shape[-1] // blocks))
+          eq = 'nki,nko->kio'
+        else:
+          x, dy = x.reshape((-1, x.shape[-1])), dy.reshape((-1, dy.shape[-1]))
+          eq = 'ni,no->io'
+        grad = jnp.einsum(eq, x, dy, preferred_element_type=f32)
+      else:
+        grad = dy.astype(f32).sum(tuple(range(dy.ndim - 1)))
+      dheavy[key] = grad.astype(dtype)
+    return dheavy, drest, dcarry, dxs, None
+
+  scan = jax.custom_vjp(lambda *a: run(*a)[0])
+  scan.defvjp(fwd, bwd)
+  carry, ys = scan(heavy, rest, carry, xs, seeds)
+  if axis:
+    ys = jax.tree.map(lambda y: y.swapaxes(0, axis), ys)
+  return carry, ys

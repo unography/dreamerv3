@@ -11,6 +11,7 @@ import numpy as np
 
 COMPUTE_DTYPE = jnp.bfloat16
 LAYER_CALLBACK = lambda tensor, name: tensor
+TAPE = None
 
 f32 = jnp.float32
 
@@ -115,6 +116,33 @@ def ensure_dtypes_bwd(fwd, bwd, cache, dx):
   assert dx.dtype == bwd, (dx.dtype, bwd)
   return (dx,)
 ensure_dtypes.defvjp(ensure_dtypes_fwd, ensure_dtypes_bwd)
+
+
+class Tape:
+
+  def __init__(self, taps=None):
+    self.taps = taps
+    self.inps = {}
+    self.specs = {}
+
+  def __call__(self, path, x, y, blocks=0):
+    assert path not in self.inps, f'Layer {path} used twice inside tape.'
+    self.inps[path] = x
+    self.specs[path] = (jax.ShapeDtypeStruct(y.shape, y.dtype), blocks)
+    return y if self.taps is None else y + self.taps[path]
+
+  def __enter__(self):
+    global TAPE
+    self.prev, TAPE = TAPE, self
+    return self
+
+  def __exit__(self, *args):
+    global TAPE
+    TAPE = self.prev
+
+
+def tap(path, x, y, blocks=0):
+  return y if TAPE is None else TAPE(path, x, y, blocks)
 
 
 def rms(xs):
@@ -241,9 +269,11 @@ class Linear(nj.Module):
     ensure_dtypes(x)
     size = math.prod(self.units)
     shape = (x.shape[-1], size)
+    inp = x
     x = x @ self.value('kernel', self._scaled_winit, shape).astype(x.dtype)
     if self.bias:
       x += self.value('bias', init(self.binit), size).astype(x.dtype)
+    x = tap(self.path, inp, x)
     x = x.reshape((*x.shape[:-1], *self.units))
     return x
 
@@ -270,11 +300,12 @@ class BlockLinear(nj.Module):
     insize = x.shape[-1]
     shape = (self.blocks, insize // self.blocks, self.units // self.blocks)
     kernel = self.value('kernel', self._scaled_winit, shape).astype(x.dtype)
-    x = x.reshape((*x.shape[:-1], self.blocks, insize // self.blocks))
+    x = inp = x.reshape((*x.shape[:-1], self.blocks, insize // self.blocks))
     x = jnp.einsum('...ki,kio->...ko', x, kernel)
     x = x.reshape((*x.shape[:-2], self.units))
     if self.bias:
       x += self.value('bias', init(self.binit), self.units).astype(x.dtype)
+    x = tap(self.path, inp, x, self.blocks)
     return x
 
   def _scaled_winit(self, *args, **kwargs):
@@ -290,6 +321,7 @@ class Conv2D(nj.Module):
   winit: str | Callable = Initializer('trunc_normal')
   binit: str | Callable = Initializer('zeros')
   outscale: float = 1.0
+  upsample: int = 1
 
   def __init__(self, depth, kernel, stride=1):
     self.depth = depth
@@ -299,24 +331,57 @@ class Conv2D(nj.Module):
   def __call__(self, x):
     ensure_dtypes(x)
     shape = (*self.kernel, x.shape[-1] // self.groups, self.depth)
-    kernel = self.value('kernel', self._scaled_winit, shape).astype(x.dtype)
-    if self.transp:
+    kernel = self.value('kernel', self._scaled_winit, shape)
+    if self.upsample > 1:
+      assert not self.transp and self.stride == 1 and self.groups == 1
       assert self.pad == 'same', self.pad
-      # Manual implementation of fractionally strided convolution because the
-      # cuDNN implementation used by XLA has bugs and performance issues.
-      x = x.repeat(self.stride, -2).repeat(self.stride, -3)
-      maskh = ((jnp.arange(x.shape[-3]) - 1) % self.stride == 0)[:, None]
-      maskw = ((jnp.arange(x.shape[-2]) - 1) % self.stride == 0)[None, :]
-      x *= (maskh * maskw)[:, :, None]
-      stride = (1, 1)
+      x = self._upsample_conv(x, kernel, self.upsample)
     else:
-      stride = (self.stride, self.stride)
-    x = jax.lax.conv_general_dilated(
-        x, kernel, stride, self.pad.upper(),
-        feature_group_count=self.groups,
-        dimension_numbers=('NHWC', 'HWIO', 'NHWC'))
+      kernel = kernel.astype(x.dtype)
+      if self.transp:
+        assert self.pad == 'same', self.pad
+        # Manual implementation of fractionally strided convolution because
+        # the cuDNN implementation used by XLA has bugs and performance issues.
+        x = x.repeat(self.stride, -2).repeat(self.stride, -3)
+        maskh = ((jnp.arange(x.shape[-3]) - 1) % self.stride == 0)[:, None]
+        maskw = ((jnp.arange(x.shape[-2]) - 1) % self.stride == 0)[None, :]
+        x *= (maskh * maskw)[:, :, None]
+        stride = (1, 1)
+      else:
+        stride = (self.stride, self.stride)
+      x = jax.lax.conv_general_dilated(
+          x, kernel, stride, self.pad.upper(),
+          feature_group_count=self.groups,
+          dimension_numbers=('NHWC', 'HWIO', 'NHWC'))
     if self.bias:
       x += self.value('bias', init(self.binit), self.depth).astype(x.dtype)
+    return x
+
+  def _upsample_conv(self, x, kernel, factor):
+    # Equivalent to nearest neighbor upsampling followed by a same-padded
+    # convolution, but computed as a single convolution at the input
+    # resolution that outputs all sub-pixel phases, followed by depth to space.
+    # This avoids convolving over the duplicated pixels and needs fewer FLOPs.
+    def taps(size):
+      offsets = [[(p + i - (size - 1) // 2) // factor for i in range(size)]
+                 for p in range(factor)]
+      lo = min(min(o) for o in offsets)
+      hi = max(max(o) for o in offsets)
+      mat = np.zeros((factor, size, hi - lo + 1), np.float32)
+      for p, row in enumerate(offsets):
+        for i, o in enumerate(row):
+          mat[p, i, o - lo] = 1
+      return mat, (-lo, hi)
+    (mh, padh), (mw, padw) = taps(kernel.shape[0]), taps(kernel.shape[1])
+    kernel = jnp.einsum('pia,qjb,ijco->abcpqo', mh, mw, f32(kernel))
+    kernel = kernel.reshape((*kernel.shape[:3], -1)).astype(x.dtype)
+    x = jax.lax.conv_general_dilated(
+        x, kernel, (1, 1), (padh, padw),
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC'))
+    B, H, W, _ = x.shape
+    x = x.reshape((B, H, W, factor, factor, self.depth))
+    x = x.transpose((0, 1, 3, 2, 4, 5))
+    x = x.reshape((B, H * factor, W * factor, self.depth))
     return x
 
   def _scaled_winit(self, *args, **kwargs):

@@ -38,7 +38,12 @@ def setup(
     jax.config.update('jax_transfer_guard', 'disallow')
   os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = str(bool(prealloc)).lower()
   jax.config.update('jax_debug_nans', debug_nans)
-  jax.config.update('jax_enable_compilation_cache', compilation_cache)
+  jax.config.update('jax_enable_compilation_cache', bool(compilation_cache))
+  if compilation_cache and not jax.config.jax_compilation_cache_dir:
+    if not isinstance(compilation_cache, str):
+      compilation_cache = '~/.cache/jax_compilation_cache'
+    jax.config.update(
+        'jax_compilation_cache_dir', os.path.expanduser(compilation_cache))
 
   xlaflags = []
   xlaflags.append(f'--xla_gpu_autotune_level={autotune}')
@@ -51,7 +56,7 @@ def setup(
     elements.Path(xladump).mkdir()
     xlaflags.append(f'--xla_dump_to={xladump}')
     xlaflags.append('--xla_dump_hlo_as_long_text')
-  if gpuflags and platform == 'gpu':
+  if gpuflags and platform in ('gpu', 'cuda'):
     # xla_flags.append('--xla_gpu_enable_latency_hiding_scheduler=true')
     # xla_flags.append('--xla_gpu_enable_async_all_gather=true')
     # xla_flags.append('--xla_gpu_enable_async_reduce_scatter=true')
@@ -72,9 +77,7 @@ def setup(
         '--xla_gpu_enable_pipelined_reduce_scatter=true',
         '--xla_gpu_enable_reduce_scatter_combine_by_dim=false',
         '--xla_gpu_enable_triton_gemm=false',
-        '--xla_gpu_enable_triton_softmax_fusion=false',
         '--xla_gpu_enable_while_loop_double_buffering=true',
-        '--xla_gpu_graph_level=0',
         '--xla_gpu_reduce_scatter_combine_threshold_bytes=67108864',
     ]
   if tpuflags and platform == 'tpu':
@@ -90,8 +93,9 @@ def setup(
         '--xla_tpu_overlap_compute_collective_tc=true',
         '--xla_enable_async_all_gather=true',
     ]
-  if xlaflags:
-    os.environ['XLA_FLAGS'] = ' '.join(xlaflags)
+  # Flags already set in the environment come last so they take precedence.
+  xlaflags.append(os.environ.get('XLA_FLAGS', ''))
+  os.environ['XLA_FLAGS'] = ' '.join(x for x in xlaflags if x)
 
   if num_processes > 1 and platform != 'tpu':
     # Note that the process_id is unrelated to the jax.process_index() that JAX
@@ -133,7 +137,7 @@ def get_data_axes():
 def fetch_async(value):
   if is_multihost():
     value = to_local(value)
-  with jax._src.config.explicit_device_get_scope():
+  with jax.transfer_guard_device_to_host('allow'):
     [x.copy_to_host_async() for x in jax.tree.leaves(value)]
   return value
 
@@ -144,7 +148,7 @@ def is_multihost():
 
 def device_put(value, sharding):
   if is_multihost():
-    with jax._src.config.explicit_device_put_scope():
+    with jax.transfer_guard_host_to_device('allow'):
       value = jax.tree.map(
           lambda x: jax.make_array_from_process_local_data(sharding, x), value)
   else:
@@ -277,9 +281,13 @@ def ckpt_fn(params, compile=True):
   keys = params.keys()
   original = {k: params[k].sharding for k in keys}
   inspec = {k: struct(params[k], original[k]) for k in keys}
-  gather_fn = jax.jit(lambda x: x, (original,), mirrored).lower(inspec)
+  gather_fn = jax.jit(
+      lambda x: x, in_shardings=(original,), out_shardings=mirrored,
+  ).lower(inspec)
   inspec = {k: struct(params[k], mirrored) for k in keys}
-  shard_fn = jax.jit(lambda x: x, (mirrored,), original).lower(inspec)
+  shard_fn = jax.jit(
+      lambda x: x, in_shardings=(mirrored,), out_shardings=original,
+  ).lower(inspec)
   if compile:
     gather_fn = gather_fn.compile()
     shard_fn = shard_fn.compile()

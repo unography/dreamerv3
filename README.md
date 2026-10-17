@@ -50,7 +50,7 @@ increases data efficiency.
 
 # Instructions
 
-The code has been tested on Linux and Mac and requires Python 3.11+.
+The code has been tested on Linux and Mac and requires Python 3.12+ (needed by JAX 0.11+).
 
 ## Docker
 

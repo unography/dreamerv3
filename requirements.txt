@@ -1,19 +1,18 @@
 ale_py==0.9.0
 autorom[accept-rom-license]==0.6.1
 av
-chex
+chex>=0.1.90
 colored_traceback
 einops
-elements>=3.19.1
+elements>=3.22.4
 google-resumable-media>=2.7.2
-granular>=0.20.3
+granular>=0.24.2
 ipdb
-jax[cuda12]==0.4.33
+jax[cuda12]>=0.11.2  # Or jax[cuda13] (needs driver 580+, Turing or newer GPUs).
 jaxtyping
-ninjax>=3.5.1
-numpy<2  # DMLab: <2, MineRLv1.0: <1.24
-nvidia-cuda-nvcc-cu12<=12.2
-optax
-portal>=3.5.0
-scope>=0.4.4
+ninjax>=3.6.3
+numpy>=2.1
+optax>=0.2.8
+portal>=3.8.1
+scope>=0.7.1
 tqdm

@@ -22,6 +22,7 @@ class RSSM(nj.Module):
   norm: str = 'rms'
   act: str = 'gelu'
   unroll: bool = False
+  tapgrad: bool = True
   unimix: float = 0.01
   outscale: float = 1.0
   imglayers: int = 2
@@ -66,7 +67,8 @@ class RSSM(nj.Module):
       return carry, entry, feat
     else:
       unroll = jax.tree.leaves(tokens)[0].shape[1] if self.unroll else 1
-      carry, (entries, feat) = nj.scan(
+      scan = embodied.jax.tap_scan if self.tapgrad else nj.scan
+      carry, (entries, feat) = scan(
           lambda carry, inputs: self._observe(
               carry, *inputs, training),
           carry, (tokens, action, reset), unroll=unroll, axis=1)
@@ -264,6 +266,7 @@ class Decoder(nj.Module):
   bspace: int = 8
   outer: bool = False
   strided: bool = False
+  subpixel: bool = True
 
   def __init__(self, obs_space, **kw):
     assert all(len(s.shape) <= 3 for s in obs_space.values()), obs_space
@@ -332,6 +335,9 @@ class Decoder(nj.Module):
         if self.strided:
           kw = dict(**self.kw, transp=True)
           x = self.sub(f'conv{i}', nn.Conv2D, depth, K, 2, **kw)(x)
+        elif self.subpixel:
+          kw = dict(**self.kw, upsample=2)
+          x = self.sub(f'conv{i}', nn.Conv2D, depth, K, **kw)(x)
         else:
           x = x.repeat(2, -2).repeat(2, -3)
           x = self.sub(f'conv{i}', nn.Conv2D, depth, K, **self.kw)(x)
@@ -342,6 +348,9 @@ class Decoder(nj.Module):
       elif self.strided:
         kw = dict(**self.kw, outscale=self.outscale, transp=True)
         x = self.sub('imgout', nn.Conv2D, self.imgdep, K, 2, **kw)(x)
+      elif self.subpixel:
+        kw = dict(**self.kw, outscale=self.outscale, upsample=2)
+        x = self.sub('imgout', nn.Conv2D, self.imgdep, K, **kw)(x)
       else:
         x = x.repeat(2, -2).repeat(2, -3)
         kw = dict(**self.kw, outscale=self.outscale)
