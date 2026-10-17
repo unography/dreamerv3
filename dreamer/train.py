@@ -76,11 +76,17 @@ class Episodes:
         self.lengths = np.zeros(num_envs, int)
         self.finished: list[tuple[float, int]] = []
 
-    def add(self, obs: dict[str, np.ndarray]) -> None:
+    def add(self, obs: dict[str, np.ndarray]) -> list[tuple[float, int]]:
+        """Adds a step [N, ...]. Gives the return and length of each episode
+        that ends with this step."""
         self.returns = np.where(obs["is_first"], 0, self.returns) + obs["reward"]
         self.lengths = np.where(obs["is_first"], 0, self.lengths) + 1
-        for env in np.flatnonzero(obs["is_last"]):
-            self.finished.append((self.returns[env], self.lengths[env]))
+        ended = [
+            (float(self.returns[env]), int(self.lengths[env]))
+            for env in np.flatnonzero(obs["is_last"])
+        ]
+        self.finished += ended
+        return ended
 
     def summary(self) -> dict[str, float]:
         """The mean return and length of the episodes since the last summary."""
@@ -101,18 +107,31 @@ def mean_metrics(metrics: list[dict]) -> dict[str, float]:
 
 
 class Logger:
-    """Writes metrics to `metrics.jsonl` in the log directory and prints them."""
+    """Writes JSONL files in the log directory.
+
+    - `metrics.jsonl`: the metrics of each log interval. The logger also
+      prints some of them.
+    - `scores.jsonl`: the score of each episode, at the step where it ends.
+      The reference implementation writes a file with the same format.
+    """
 
     def __init__(self, logdir: pathlib.Path):
-        self.path = logdir / "metrics.jsonl"
+        self.logdir = logdir
+
+    def write_score(self, step: int, score: float, length: int) -> None:
+        row = {"step": step, "episode/score": score, "episode/length": length}
+        self._append("scores.jsonl", row)
 
     def write(self, step: int, metrics: dict[str, float]) -> None:
         metrics = {name: float(value) for name, value in metrics.items()}
-        with self.path.open("a") as file:
-            file.write(json.dumps({"step": step, **metrics}) + "\n")
+        self._append("metrics.jsonl", {"step": step, **metrics})
         shown = ("episode/score", "train/loss/rec", "train/loss/policy", "fps/env")
         items = [f"{name} {metrics[name]:.4g}" for name in shown if name in metrics]
         print(f"step {step}", *items, sep=" | ", flush=True)
+
+    def _append(self, name: str, row: dict) -> None:
+        with (self.logdir / name).open("a") as file:
+            file.write(json.dumps(row) + "\n")
 
 
 def train(args: Args) -> None:
@@ -161,8 +180,9 @@ def train(args: Args) -> None:
                 "stoch": np.asarray(rssm_state.stoch, np.float32),
             }
         )
-        episodes.add(obs)
         step += args.envs
+        for score, length in episodes.add(obs):
+            logger.write_score(step, score, length)
 
         # Train on replay data, after the buffer has enough sequences.
         if len(replay) >= batch_steps:

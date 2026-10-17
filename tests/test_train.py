@@ -34,7 +34,7 @@ def test_episodes_give_the_return_and_length_of_finished_episodes():
         ([1, 2], [False, False], [False, True]),
         ([3, 0], [False, True], [True, False]),
     ]
-    for reward, is_first, is_last in steps:
+    ended = [
         episodes.add(
             {
                 "reward": np.array(reward, np.float32),
@@ -42,9 +42,11 @@ def test_episodes_give_the_return_and_length_of_finished_episodes():
                 "is_last": np.array(is_last),
             }
         )
+        for reward, is_first, is_last in steps
+    ]
 
+    assert ended == [[], [(2.0, 2)], [(4.0, 3)]]
     summary = episodes.summary()
-
     assert summary == {"episode/score": (2 + 4) / 2, "episode/length": (2 + 3) / 2}
     assert episodes.summary() == {}
 
@@ -70,3 +72,8 @@ def test_training_runs_and_writes_metrics(tmp_path):
     assert metrics[-1]["train_steps"] > 0
     assert np.isfinite(metrics[-1]["train/loss/rec"])
     assert 0 <= metrics[-1]["episode/score"] <= 1000
+
+    lines = (tmp_path / "scores.jsonl").read_text().splitlines()
+    scores = [json.loads(line) for line in lines]
+    assert [row["step"] for row in scores] == [2002, 2002]
+    assert [row["episode/length"] for row in scores] == [1001, 1001]
