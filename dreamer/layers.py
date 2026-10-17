@@ -11,6 +11,10 @@ Some output layers start with small or zero weights. A head with zero weights
 predicts exactly zero at the start of training. `scaled_init` makes these
 initializations.
 
+Mixed precision: the layers keep their weights in float32. With the argument
+`dtype=jnp.bfloat16`, they compute in bfloat16, which is faster on GPUs.
+RMSNorm computes its statistics in float32 also then.
+
 Reference: appendix "Networks" of the DreamerV3 paper.
 """
 
@@ -19,6 +23,7 @@ import itertools
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.typing import DTypeLike
 
 
 def scaled_init(scale: float) -> nnx.Initializer:
@@ -33,9 +38,16 @@ class Dense(nnx.Module):
     activations stay in a good range for the next layer.
     """
 
-    def __init__(self, in_features: int, out_features: int, *, rngs: nnx.Rngs):
-        self.linear = nnx.Linear(in_features, out_features, rngs=rngs)
-        self.norm = nnx.RMSNorm(out_features, epsilon=1e-4, rngs=rngs)
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        dtype: DTypeLike = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
+        self.linear = nnx.Linear(in_features, out_features, dtype=dtype, rngs=rngs)
+        self.norm = nnx.RMSNorm(out_features, epsilon=1e-4, dtype=dtype, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         return jax.nn.silu(self.norm(self.linear(x)))
@@ -44,10 +56,18 @@ class Dense(nnx.Module):
 class MLP(nnx.Module):
     """A stack of `Dense` layers with the same width."""
 
-    def __init__(self, in_features: int, units: int, layers: int, *, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        in_features: int,
+        units: int,
+        layers: int,
+        *,
+        dtype: DTypeLike = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
         sizes = [in_features] + [units] * layers
         pairs = itertools.pairwise(sizes)
-        self.layers = nnx.List([Dense(i, o, rngs=rngs) for i, o in pairs])
+        self.layers = nnx.List([Dense(i, o, dtype=dtype, rngs=rngs) for i, o in pairs])
 
     def __call__(self, x: jax.Array) -> jax.Array:
         for layer in self.layers:
@@ -69,16 +89,24 @@ class BlockLinear(nnx.Module):
     """
 
     def __init__(
-        self, in_features: int, out_features: int, blocks: int, *, rngs: nnx.Rngs
+        self,
+        in_features: int,
+        out_features: int,
+        blocks: int,
+        *,
+        dtype: DTypeLike = jnp.float32,
+        rngs: nnx.Rngs,
     ):
         assert in_features % blocks == 0
         assert out_features % blocks == 0
         self.blocks = blocks
+        self.dtype = dtype
         shape = (blocks, in_features // blocks, out_features // blocks)
         self.kernel = nnx.Param(nnx.initializers.lecun_normal()(rngs.params(), shape))
         self.bias = nnx.Param(jnp.zeros(out_features))
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        x = x.reshape(*x.shape[:-1], self.blocks, -1)  # [..., G, I]
-        x = jnp.einsum("...gi,gio->...go", x, self.kernel[...])  # [..., G, O]
-        return x.reshape(*x.shape[:-2], -1) + self.bias[...]
+        kernel = self.kernel[...].astype(self.dtype)
+        x = x.astype(self.dtype).reshape(*x.shape[:-1], self.blocks, -1)  # [..., G, I]
+        x = jnp.einsum("...gi,gio->...go", x, kernel)  # [..., G, O]
+        return x.reshape(*x.shape[:-2], -1) + self.bias[...].astype(self.dtype)

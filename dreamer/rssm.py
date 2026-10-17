@@ -29,6 +29,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.typing import DTypeLike
 
 from dreamer.distributions import OneHotCategorical
 from dreamer.layers import MLP, BlockLinear, Dense
@@ -58,6 +59,7 @@ class RSSM(nnx.Module):
         classes: the number of classes of each categorical variable.
         blocks: the number of blocks of the recurrent network.
         unimix: the part of the uniform distribution in each categorical.
+        dtype: the dtype of the computations and of the state.
     """
 
     def __init__(
@@ -71,6 +73,7 @@ class RSSM(nnx.Module):
         classes: int = 4,
         blocks: int = 8,
         unimix: float = 0.01,
+        dtype: DTypeLike = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.deter_size = deter
@@ -78,27 +81,29 @@ class RSSM(nnx.Module):
         self.classes = classes
         self.blocks = blocks
         self.unimix = unimix
+        self.dtype = dtype
+        kw = dict(dtype=dtype, rngs=rngs)
 
         # The recurrent network: a GRU with block-diagonal weights.
-        self.deter_in = Dense(deter, hidden, rngs=rngs)
-        self.stoch_in = Dense(stoch * classes, hidden, rngs=rngs)
-        self.action_in = Dense(action_size, hidden, rngs=rngs)
+        self.deter_in = Dense(deter, hidden, **kw)
+        self.stoch_in = Dense(stoch * classes, hidden, **kw)
+        self.action_in = Dense(action_size, hidden, **kw)
         gru_in = deter + blocks * 3 * hidden
-        self.gru_hidden = BlockLinear(gru_in, deter, blocks, rngs=rngs)
-        self.gru_norm = nnx.RMSNorm(deter, epsilon=1e-4, rngs=rngs)
-        self.gru_gates = BlockLinear(deter, 3 * deter, blocks, rngs=rngs)
+        self.gru_hidden = BlockLinear(gru_in, deter, blocks, **kw)
+        self.gru_norm = nnx.RMSNorm(deter, epsilon=1e-4, **kw)
+        self.gru_gates = BlockLinear(deter, 3 * deter, blocks, **kw)
 
         # The posterior q(z | h, e) and the prior p(z | h).
-        self.posterior_hidden = Dense(deter + token_size, hidden, rngs=rngs)
-        self.posterior_logits = nnx.Linear(hidden, stoch * classes, rngs=rngs)
-        self.prior_hidden = MLP(deter, hidden, layers=2, rngs=rngs)
-        self.prior_logits = nnx.Linear(hidden, stoch * classes, rngs=rngs)
+        self.posterior_hidden = Dense(deter + token_size, hidden, **kw)
+        self.posterior_logits = nnx.Linear(hidden, stoch * classes, **kw)
+        self.prior_hidden = MLP(deter, hidden, layers=2, **kw)
+        self.prior_logits = nnx.Linear(hidden, stoch * classes, **kw)
 
     def initial(self, batch_size: int) -> State:
         """The state before the first step of an episode: all zeros."""
         return State(
-            deter=jnp.zeros((batch_size, self.deter_size)),
-            stoch=jnp.zeros((batch_size, self.stoch_size, self.classes)),
+            deter=jnp.zeros((batch_size, self.deter_size), self.dtype),
+            stoch=jnp.zeros((batch_size, self.stoch_size, self.classes), self.dtype),
         )
 
     def dist(self, logits: jax.Array) -> OneHotCategorical:
@@ -130,7 +135,7 @@ class RSSM(nnx.Module):
         action = action * _expand(keep, action)
         deter = self.recurrent(state, action)
         logits = self.posterior(deter, token)
-        stoch = self.dist(logits).sample(key)
+        stoch = self.dist(logits).sample(key).astype(self.dtype)
         return State(deter, stoch), logits
 
     def img_step(
@@ -143,7 +148,7 @@ class RSSM(nnx.Module):
         """
         deter = self.recurrent(state, action)
         logits = self.prior(deter)
-        stoch = self.dist(logits).sample(key)
+        stoch = self.dist(logits).sample(key).astype(self.dtype)
         return State(deter, stoch), logits
 
     def observe(
@@ -174,7 +179,7 @@ class RSSM(nnx.Module):
 
         inputs = _swap_batch_and_time((prev_actions, tokens, is_first))
         keys = jax.random.split(key, tokens.shape[1])
-        _, outputs = jax.lax.scan(step, state, (*inputs, keys))
+        _, outputs = jax.lax.scan(step, self._cast(state), (*inputs, keys))
         return _swap_batch_and_time(outputs)
 
     def imagine(
@@ -204,6 +209,7 @@ class RSSM(nnx.Module):
             state, _ = self.img_step(state, action, step_key)
             return state, (state, action)
 
+        start = self._cast(start)
         keys = jax.random.split(key, horizon)
         _, (states, actions) = jax.lax.scan(step, start, keys)
         states = jax.tree.map(
@@ -249,6 +255,7 @@ class RSSM(nnx.Module):
         """Computes the next deterministic state h_t = f(h_t-1, z_t-1, a_t-1)."""
         deter = state.deter  # [B, D]
         stoch = state.stoch.reshape(*state.stoch.shape[:-2], -1)  # [B, S * C]
+        action = action.astype(self.dtype)
         # The environment clips actions to [-1, 1], but the samples of the
         # policy can be outside of this range. Thus the model also clips them.
         action = action / jax.lax.stop_gradient(jnp.maximum(1, jnp.abs(action)))
@@ -276,7 +283,7 @@ class RSSM(nnx.Module):
         candidate = jnp.tanh(reset * candidate)
         # The offset of -1 keeps most of the old state at the start of training.
         update = jax.nn.sigmoid(update - 1)
-        return update * candidate + (1 - update) * deter
+        return (update * candidate + (1 - update) * deter).astype(self.dtype)
 
     def posterior(self, deter: jax.Array, token: jax.Array) -> jax.Array:
         """The logits [..., S, C] of q(z_t | h_t, e_t)."""
@@ -286,6 +293,10 @@ class RSSM(nnx.Module):
     def prior(self, deter: jax.Array) -> jax.Array:
         """The logits [..., S, C] of p(z_t | h_t)."""
         return self._reshape(self.prior_logits(self.prior_hidden(deter)))
+
+    def _cast(self, state: State) -> State:
+        """Casts a state, for example a state from the replay buffer."""
+        return jax.tree.map(lambda x: x.astype(self.dtype), state)
 
     def _reshape(self, logits: jax.Array) -> jax.Array:
         return logits.reshape(*logits.shape[:-1], self.stoch_size, self.classes)

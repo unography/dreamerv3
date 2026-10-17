@@ -1,7 +1,8 @@
 """Output distributions of the network heads.
 
 Each head gives the parameters of a distribution. The distribution then gives
-predictions, samples, and losses.
+predictions, samples, and losses. The distributions compute in float32, also
+when the networks compute in bfloat16, so the losses stay accurate.
 """
 
 import jax
@@ -58,7 +59,7 @@ class TwoHot:
     def __init__(self, logits: jax.Array, bins: jax.Array):
         assert logits.shape[-1] == len(bins)
         assert len(bins) % 2 == 1, "The mean needs a center bin at zero."
-        self.logits = logits
+        self.logits = logits.astype(jnp.float32)
         self.bins = bins
 
     def mean(self) -> jax.Array:
@@ -95,6 +96,7 @@ class OneHotCategorical:
     """
 
     def __init__(self, logits: jax.Array, unimix: float = 0.0):
+        logits = logits.astype(jnp.float32)
         if unimix:
             probs = jax.nn.softmax(logits)
             probs = (1 - unimix) * probs + unimix / logits.shape[-1]
@@ -121,8 +123,8 @@ class Normal:
     """An independent normal distribution for each action dimension."""
 
     def __init__(self, mean: jax.Array, std: jax.Array):
-        self.mean = mean
-        self.std = std
+        self.mean = jnp.asarray(mean, jnp.float32)
+        self.std = jnp.asarray(std, jnp.float32)
 
     def sample(self, key: jax.Array) -> jax.Array:
         return self.mean + self.std * jax.random.normal(key, self.mean.shape)
@@ -148,6 +150,7 @@ def bounded_normal(
 
     The samples are not bounded. The environment clips them to [-1, 1].
     """
+    mean, std = mean.astype(jnp.float32), std.astype(jnp.float32)
     std = (max_std - min_std) * jax.nn.sigmoid(std + 2.0) + min_std
     return Normal(jnp.tanh(mean), std)
 
@@ -156,7 +159,7 @@ class Bernoulli:
     """A distribution over 0 and 1, with the probability of 1 from a logit."""
 
     def __init__(self, logit: jax.Array):
-        self.logit = logit
+        self.logit = logit.astype(jnp.float32)
 
     def prob(self) -> jax.Array:
         """The probability of 1."""

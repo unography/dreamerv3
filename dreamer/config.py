@@ -20,6 +20,8 @@ class Config:
     classes: int = 4  # The number of classes of each categorical variable.
     blocks: int = 8  # The number of blocks of the recurrent network.
     units: int = 64  # The width of the encoder, decoder, and heads.
+    # The dtype of the computations. The weights stay in float32.
+    compute_dtype: str = "bfloat16"
 
     # The world model.
     replay_context: bool = True  # Start sequences from the stored RSSM state.

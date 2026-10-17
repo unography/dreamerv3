@@ -12,6 +12,7 @@ paper.
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.typing import DTypeLike
 
 from dreamer.distributions import Normal, TwoHot, bounded_normal
 from dreamer.layers import MLP, scaled_init
@@ -123,14 +124,15 @@ class Actor(nnx.Module):
         layers: int = 3,
         min_std: float = 0.1,
         max_std: float = 1.0,
+        dtype: DTypeLike = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.min_std = min_std
         self.max_std = max_std
-        self.mlp = MLP(feature_size, units, layers, rngs=rngs)
-        init = scaled_init(0.01)
-        self.mean = nnx.Linear(units, action_size, kernel_init=init, rngs=rngs)
-        self.std = nnx.Linear(units, action_size, kernel_init=init, rngs=rngs)
+        self.mlp = MLP(feature_size, units, layers, dtype=dtype, rngs=rngs)
+        kw = dict(kernel_init=scaled_init(0.01), dtype=dtype, rngs=rngs)
+        self.mean = nnx.Linear(units, action_size, **kw)
+        self.std = nnx.Linear(units, action_size, **kw)
 
     def __call__(self, features: jax.Array) -> Normal:
         x = self.mlp(features)

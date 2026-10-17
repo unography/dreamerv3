@@ -136,6 +136,17 @@ def test_without_replay_context_sequences_start_from_the_initial_state():
     assert train_metrics(other_state, config)["loss/rec"] == metrics["loss/rec"]
 
 
+def test_bfloat16_compute_keeps_float32_weights_and_losses():
+    agent = make_agent(dataclasses.replace(SMALL, compute_dtype="bfloat16"))
+
+    metrics, states = agent.train(replay_batch(), jax.random.key(1))
+
+    weights = jax.tree.leaves(nnx.state(agent, nnx.Param))
+    assert {weight.dtype for weight in weights} == {jnp.dtype(jnp.float32)}
+    assert metrics["loss/rec"].dtype == jnp.float32
+    assert states.deter.dtype == jnp.bfloat16
+
+
 N = 3  # The number of environments.
 
 
@@ -160,6 +171,7 @@ def test_policy_gives_one_action_for_each_environment():
     )
 
     assert action.shape == (N, A)
+    assert action.dtype == jnp.float32
     assert jnp.isfinite(action).all()
 
 

@@ -157,8 +157,8 @@ def train(args: Args) -> None:
             {
                 **obs,
                 "action": action,  # The action after the observation.
-                "deter": np.asarray(rssm_state.deter),
-                "stoch": np.asarray(rssm_state.stoch),
+                "deter": np.asarray(rssm_state.deter, np.float32),
+                "stoch": np.asarray(rssm_state.stoch, np.float32),
             }
         )
         episodes.add(obs)

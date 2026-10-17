@@ -58,6 +58,7 @@ class Agent(nnx.Module):
     ):
         c = self.config = config
         self.action_size = action_size
+        dtype = jnp.dtype(c.compute_dtype)
         self.world_model = WorldModel(
             obs_shapes,
             action_size,
@@ -68,6 +69,7 @@ class Agent(nnx.Module):
             blocks=c.blocks,
             units=c.units,
             unimix=c.unimix,
+            dtype=dtype,
             rngs=rngs,
         )
         feature_size = c.deter + c.stoch * c.classes
@@ -78,9 +80,12 @@ class Agent(nnx.Module):
             layers=3,
             min_std=c.min_std,
             max_std=c.max_std,
+            dtype=dtype,
             rngs=rngs,
         )
-        self.critic = TwoHotHead(feature_size, units=c.units, layers=3, rngs=rngs)
+        self.critic = TwoHotHead(
+            feature_size, units=c.units, layers=3, dtype=dtype, rngs=rngs
+        )
         self.slow_critic = nnx.clone(self.critic)
         self.return_norm = ReturnNorm(rate=c.return_norm_rate)
         self.optimizer = nnx.Optimizer(

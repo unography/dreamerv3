@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.typing import DTypeLike
 
 from dreamer.distributions import Bernoulli, TwoHot, symexp_bins
 from dreamer.layers import MLP, scaled_init
@@ -42,11 +43,12 @@ class Encoder(nnx.Module):
         *,
         units: int = 64,
         layers: int = 3,
+        dtype: DTypeLike = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.keys = sorted(obs_shapes)
         size = sum(obs_shapes[key][0] for key in self.keys)
-        self.mlp = MLP(size, units, layers, rngs=rngs)
+        self.mlp = MLP(size, units, layers, dtype=dtype, rngs=rngs)
 
     def __call__(self, obs: dict[str, jax.Array]) -> jax.Array:
         x = jnp.concatenate([obs[key] for key in self.keys], -1)
@@ -66,12 +68,13 @@ class Decoder(nnx.Module):
         *,
         units: int = 64,
         layers: int = 3,
+        dtype: DTypeLike = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.keys = sorted(obs_shapes)
         self.sizes = [obs_shapes[key][0] for key in self.keys]
-        self.mlp = MLP(feature_size, units, layers, rngs=rngs)
-        self.out = nnx.Linear(units, sum(self.sizes), rngs=rngs)
+        self.mlp = MLP(feature_size, units, layers, dtype=dtype, rngs=rngs)
+        self.out = nnx.Linear(units, sum(self.sizes), dtype=dtype, rngs=rngs)
 
     def __call__(self, features: jax.Array) -> dict[str, jax.Array]:
         x = self.out(self.mlp(features))
@@ -86,6 +89,7 @@ def symlog_mse(prediction: jax.Array, target: jax.Array) -> jax.Array:
     large targets, the loss is much smaller. Thus observations with large
     values do not dominate the loss.
     """
+    prediction = prediction.astype(jnp.float32)
     return jnp.square(prediction - symlog(target)).sum(-1)
 
 
@@ -104,11 +108,13 @@ class TwoHotHead(nnx.Module):
         units: int = 64,
         layers: int = 1,
         bins: int = 255,
+        dtype: DTypeLike = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.bins = bins
-        self.mlp = MLP(in_features, units, layers, rngs=rngs)
-        self.out = nnx.Linear(units, bins, kernel_init=scaled_init(0.0), rngs=rngs)
+        self.mlp = MLP(in_features, units, layers, dtype=dtype, rngs=rngs)
+        init = scaled_init(0.0)
+        self.out = nnx.Linear(units, bins, kernel_init=init, dtype=dtype, rngs=rngs)
 
     def __call__(self, features: jax.Array) -> TwoHot:
         return TwoHot(self.out(self.mlp(features)), symexp_bins(self.bins))
@@ -118,10 +124,16 @@ class ContinueHead(nnx.Module):
     """An MLP that predicts if the episode continues after a step."""
 
     def __init__(
-        self, in_features: int, *, units: int = 64, layers: int = 1, rngs: nnx.Rngs
+        self,
+        in_features: int,
+        *,
+        units: int = 64,
+        layers: int = 1,
+        dtype: DTypeLike = jnp.float32,
+        rngs: nnx.Rngs,
     ):
-        self.mlp = MLP(in_features, units, layers, rngs=rngs)
-        self.out = nnx.Linear(units, 1, rngs=rngs)
+        self.mlp = MLP(in_features, units, layers, dtype=dtype, rngs=rngs)
+        self.out = nnx.Linear(units, 1, dtype=dtype, rngs=rngs)
 
     def __call__(self, features: jax.Array) -> Bernoulli:
         return Bernoulli(self.out(self.mlp(features))[..., 0])
@@ -156,11 +168,13 @@ class WorldModel(nnx.Module):
         blocks: int = 8,
         units: int = 64,
         unimix: float = 0.01,
+        dtype: DTypeLike = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.obs_keys = sorted(obs_shapes)
         feature_size = deter + stoch * classes
-        self.encoder = Encoder(obs_shapes, units=units, layers=3, rngs=rngs)
+        kw = dict(units=units, dtype=dtype, rngs=rngs)
+        self.encoder = Encoder(obs_shapes, layers=3, **kw)
         self.rssm = RSSM(
             units,
             action_size,
@@ -170,13 +184,12 @@ class WorldModel(nnx.Module):
             classes=classes,
             blocks=blocks,
             unimix=unimix,
+            dtype=dtype,
             rngs=rngs,
         )
-        self.decoder = Decoder(
-            feature_size, obs_shapes, units=units, layers=3, rngs=rngs
-        )
-        self.reward = TwoHotHead(feature_size, units=units, layers=1, rngs=rngs)
-        self.cont = ContinueHead(feature_size, units=units, layers=1, rngs=rngs)
+        self.decoder = Decoder(feature_size, obs_shapes, layers=3, **kw)
+        self.reward = TwoHotHead(feature_size, layers=1, **kw)
+        self.cont = ContinueHead(feature_size, layers=1, **kw)
 
     def loss(
         self,
