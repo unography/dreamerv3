@@ -69,3 +69,43 @@ class DMC:
         obs["is_last"] = np.bool_(time_step.last())
         obs["is_terminal"] = np.bool_(not first and time_step.discount == 0)
         return obs
+
+
+class BatchEnv:
+    """Runs several environments in lockstep.
+
+    An environment ends an episode with a step that has `is_last`. On the next
+    call to `step`, the runner resets that environment and ignores its action.
+    Thus each environment gives one continuous stream of steps:
+
+        first, ..., last, first, ..., last, first, ...
+
+    Before the first call to `step`, no episode has started. Thus the first
+    call resets all environments.
+    """
+
+    def __init__(self, envs: list[DMC]):
+        self.envs = envs
+        self._needs_reset = np.ones(len(envs), bool)
+
+    def __len__(self) -> int:
+        return len(self.envs)
+
+    @property
+    def obs_shapes(self) -> dict[str, tuple[int]]:
+        return self.envs[0].obs_shapes
+
+    @property
+    def action_size(self) -> int:
+        return self.envs[0].action_size
+
+    def step(self, actions: np.ndarray) -> dict[str, np.ndarray]:
+        """Steps all environments with actions [N, A] and gives steps [N, ...]."""
+        resets = self._needs_reset
+        steps = [
+            env.reset() if reset else env.step(action)
+            for env, action, reset in zip(self.envs, actions, resets, strict=True)
+        ]
+        batch = {key: np.stack([step[key] for step in steps]) for key in steps[0]}
+        self._needs_reset = batch["is_last"].copy()
+        return batch
