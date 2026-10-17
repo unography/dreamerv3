@@ -13,8 +13,12 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from dreamer.distributions import Normal, bounded_normal
+from dreamer.distributions import Normal, TwoHot, bounded_normal
 from dreamer.layers import MLP, scaled_init
+from dreamer.rssm import State
+from dreamer.world_model import TwoHotHead, WorldModel
+
+sg = jax.lax.stop_gradient
 
 
 def lambda_return(
@@ -145,3 +149,143 @@ def update_slow_critic(
     slow = nnx.state(slow_critic, nnx.Param)
     fast = nnx.state(critic, nnx.Param)
     nnx.update(slow_critic, jax.tree.map(lambda s, f: s + rate * (f - s), slow, fast))
+
+
+def actor_loss(
+    policy: Normal,
+    actions: jax.Array,
+    advantages: jax.Array,
+    weight: jax.Array,
+    entropy_scale: float = 3e-4,
+) -> jax.Array:
+    """The loss of the actor: REINFORCE with an entropy bonus.
+
+    The loss increases the log probability of actions with a positive
+    advantage, and decreases the log probability of actions with a negative
+    advantage. The gradient does not go through the world model. The
+    entropy bonus keeps the policy random, so the agent continues to explore.
+    The advantages are normalized, so one entropy scale works for all tasks.
+
+    Args:
+        policy: the distributions [N, H, A] of the actor.
+        actions: the imagined actions [N, H, A].
+        advantages: the normalized advantages [N, H].
+        weight: the weight of each step [N, H].
+        entropy_scale: the scale of the entropy bonus.
+
+    Returns:
+        The loss [N, H].
+    """
+    log_prob = policy.log_prob(sg(actions)).sum(-1)
+    entropy = policy.entropy().sum(-1)
+    return -sg(weight) * (log_prob * sg(advantages) + entropy_scale * entropy)
+
+
+def critic_loss(
+    critic: TwoHot,
+    returns: jax.Array,
+    slow_values: jax.Array,
+    weight: jax.Array,
+    slow_reg: float = 1.0,
+) -> jax.Array:
+    """The loss of the critic.
+
+    The critic learns the λ-returns with the two-hot loss. A second loss term
+    pulls the critic toward the predictions of the slow critic. The slow
+    critic changes slowly, so this term makes the critic training stable.
+
+    Args:
+        critic: the distributions [N, H] of the critic.
+        returns: the λ-returns [N, H].
+        slow_values: the predictions [N, H] of the slow critic.
+        weight: the weight of each step [N, H].
+        slow_reg: the scale of the slow critic term.
+
+    Returns:
+        The loss [N, H].
+    """
+    loss = critic.loss(sg(returns)) + slow_reg * critic.loss(sg(slow_values))
+    return sg(weight) * loss
+
+
+def imagination_loss(
+    world_model: WorldModel,
+    actor: Actor,
+    critic: TwoHotHead,
+    slow_critic: TwoHotHead,
+    return_norm: ReturnNorm,
+    start: State,
+    key: jax.Array,
+    *,
+    horizon: int = 15,
+    lam: float = 0.95,
+    entropy_scale: float = 3e-4,
+    slow_reg: float = 1.0,
+) -> tuple[dict[str, jax.Array], jax.Array, dict[str, jax.Array]]:
+    """The losses of the actor and the critic on imagined trajectories.
+
+    The world model imagines trajectories of `horizon` steps from each start
+    state. The heads of the world model predict the rewards and the
+    discounts along the trajectories. The λ-returns of these predictions are
+    the targets of the critic, and give the advantages of the actor.
+
+    Each step has a weight: the product of the predicted discounts up to that
+    step. Thus steps after a predicted end of the episode count less.
+
+    The world model does not learn from these losses. It only learns to
+    predict the environment.
+
+    Args:
+        world_model: gives the imagined trajectories and their rewards.
+        actor: the policy that chooses the imagined actions.
+        critic: the critic that the loss trains.
+        slow_critic: the moving average of the critic.
+        return_norm: the scale of the returns. The loss updates it.
+        start: the start states [N, ...], usually the posterior states of
+            replay data.
+        key: the random key for the imagination.
+
+    Returns:
+        The losses `policy` and `value`, each [N, H], the λ-returns [N, H],
+        and metrics.
+    """
+
+    def act(state, key):
+        return actor(state.features()).sample(key)
+
+    states, actions = world_model.rssm.imagine(start, act, horizon, key)
+    states = sg(states)  # The world model does not learn from these losses.
+    features = states.features()  # [N, H + 1, F]
+    reward = sg(world_model.reward(features).mean())  # [N, H + 1]
+    discount = sg(world_model.cont(features).prob())  # [N, H + 1]
+    value = sg(critic(features).mean())  # [N, H + 1]
+
+    returns = lambda_return(reward, value, discount, lam)  # [N, H]
+    weight = jnp.cumprod(discount, axis=1)[:, :-1]  # [N, H]
+    return_norm.update(returns)
+    advantages = (returns - value[:, :-1]) / return_norm.scale()
+
+    # The last state has no return, so the losses use the first H states.
+    features = features[:, :-1]
+    policy = actor(features)
+    losses = {
+        "policy": actor_loss(policy, actions, advantages, weight, entropy_scale),
+        "value": critic_loss(
+            critic(features),
+            returns,
+            slow_critic(features).mean(),
+            weight,
+            slow_reg,
+        ),
+    }
+    metrics = {
+        "return": returns.mean(),
+        "return_scale": return_norm.scale(),
+        "advantage": advantages.mean(),
+        "advantage_std": advantages.std(),
+        "policy_entropy": policy.entropy().sum(-1).mean(),
+        "policy_std": policy.std.mean(),
+        "imagined_reward": reward.mean(),
+        "imagined_discount": discount.mean(),
+    }
+    return losses, returns, metrics
