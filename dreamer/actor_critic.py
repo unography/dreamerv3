@@ -2,7 +2,8 @@
 
 The agent learns its behavior from imagined trajectories of the world model.
 The critic predicts the return of each state. The actor chooses actions, and
-learns to choose actions with high returns.
+learns to choose actions with high returns. Both use the model features [h, z]
+as their input.
 
 Reference: sections "Critic learning" and "Actor learning" of the DreamerV3
 paper.
@@ -11,6 +12,9 @@ paper.
 import jax
 import jax.numpy as jnp
 from flax import nnx
+
+from dreamer.distributions import Normal, bounded_normal
+from dreamer.layers import MLP, scaled_init
 
 
 def lambda_return(
@@ -97,3 +101,47 @@ class ReturnNorm(nnx.Module):
 
     def scale(self) -> jax.Array:
         return jnp.maximum(self.limit, self.high[...] - self.low[...])
+
+
+class Actor(nnx.Module):
+    """The policy: a normal distribution over actions for each model state.
+
+    The output layers start with small weights. Thus at the start of training,
+    the policy has a mean near 0 and a large standard deviation in each state.
+    """
+
+    def __init__(
+        self,
+        feature_size: int,
+        action_size: int,
+        *,
+        units: int = 64,
+        layers: int = 3,
+        min_std: float = 0.1,
+        max_std: float = 1.0,
+        rngs: nnx.Rngs,
+    ):
+        self.min_std = min_std
+        self.max_std = max_std
+        self.mlp = MLP(feature_size, units, layers, rngs=rngs)
+        init = scaled_init(0.01)
+        self.mean = nnx.Linear(units, action_size, kernel_init=init, rngs=rngs)
+        self.std = nnx.Linear(units, action_size, kernel_init=init, rngs=rngs)
+
+    def __call__(self, features: jax.Array) -> Normal:
+        x = self.mlp(features)
+        return bounded_normal(self.mean(x), self.std(x), self.min_std, self.max_std)
+
+
+def update_slow_critic(
+    slow_critic: nnx.Module, critic: nnx.Module, rate: float = 0.02
+) -> None:
+    """Moves the weights of the slow critic toward the weights of the critic.
+
+    The slow critic is an exponential moving average of the critic. Its
+    predictions change slowly, so the critic loss can use them as a stable
+    target.
+    """
+    slow = nnx.state(slow_critic, nnx.Param)
+    fast = nnx.state(critic, nnx.Param)
+    nnx.update(slow_critic, jax.tree.map(lambda s, f: s + rate * (f - s), slow, fast))
