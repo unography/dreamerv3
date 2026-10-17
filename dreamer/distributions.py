@@ -75,3 +75,43 @@ class TwoHot:
     def loss(self, target: jax.Array) -> jax.Array:
         target = jax.lax.stop_gradient(two_hot(target, self.bins))
         return -(target * jax.nn.log_softmax(self.logits)).sum(-1)
+
+
+class OneHotCategorical:
+    """A categorical distribution with one-hot samples.
+
+    The stochastic state of the world model is a vector of these
+    distributions. The distribution uses two methods from DreamerV3:
+
+    - Unimix: the probabilities are a mix of 99% softmax and 1% uniform. Thus
+      no class has a probability near zero, and the KL divergence between two
+      distributions has an upper limit. Without this limit, the KL losses can
+      have large spikes.
+    - Straight-through gradients: a one-hot sample has no gradient. Thus a
+      sample uses the gradient of the probabilities instead.
+
+    Reference: section "World model learning" and appendix "Distributions"
+    of the DreamerV3 paper.
+    """
+
+    def __init__(self, logits: jax.Array, unimix: float = 0.0):
+        if unimix:
+            probs = jax.nn.softmax(logits)
+            probs = (1 - unimix) * probs + unimix / logits.shape[-1]
+            logits = jnp.log(probs)
+        self.log_probs = jax.nn.log_softmax(logits)
+        self.probs = jnp.exp(self.log_probs)
+
+    def sample(self, key: jax.Array) -> jax.Array:
+        index = jax.random.categorical(key, self.log_probs)
+        onehot = jax.nn.one_hot(index, self.probs.shape[-1], dtype=self.probs.dtype)
+        # The value is the one-hot vector. The gradient is the gradient of the
+        # probabilities. The parentheses make the value exact: they add zero.
+        return onehot + (self.probs - jax.lax.stop_gradient(self.probs))
+
+    def entropy(self) -> jax.Array:
+        return -(self.probs * self.log_probs).sum(-1)
+
+    def kl(self, other: "OneHotCategorical") -> jax.Array:
+        """The KL divergence KL(self || other)."""
+        return (self.probs * (self.log_probs - other.log_probs)).sum(-1)
