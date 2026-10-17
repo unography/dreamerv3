@@ -1,0 +1,28 @@
+[project]
+name = "dreamer"
+version = "0.1.0"
+description = "A small DreamerV3 in JAX and Flax NNX, written to teach."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flax>=0.12.10",
+    "jax>=0.11.2",
+    "numpy>=2.1",
+]
+
+[project.optional-dependencies]
+cuda = ["jax[cuda12]>=0.11.2"]
+test = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["dreamer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
