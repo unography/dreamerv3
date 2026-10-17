@@ -44,6 +44,7 @@ class Config:
     con_scale: float = 1.0
     policy_scale: float = 1.0
     value_scale: float = 1.0
+    repval_scale: float = 0.3
 
     # The optimizer.
     lr: float = 4e-5

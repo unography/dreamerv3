@@ -6,10 +6,11 @@ One training step does these operations on a batch of replay sequences:
    posterior state of each step.
 2. The actor and the critic imagine trajectories from all of these states and
    give their losses.
-3. One optimizer step on the sum of all losses trains all networks. Stop
-   gradients keep the losses apart: the world model learns only from its own
-   losses.
-4. The slow critic moves toward the critic.
+3. The critic also learns the returns of the replay sequences.
+4. One optimizer step on the sum of all losses trains all networks. Stop
+   gradients keep the losses apart: the actor-critic losses on imagined
+   trajectories do not train the world model.
+5. The slow critic moves toward the critic.
 
 In the environment, the agent acts with `policy`. The policy keeps the RSSM
 state of each environment, updates it with each observation, and samples an
@@ -25,6 +26,7 @@ from dreamer.actor_critic import (
     Actor,
     ReturnNorm,
     imagination_loss,
+    replay_value_loss,
     update_slow_critic,
 )
 from dreamer.config import Config
@@ -148,7 +150,7 @@ class Agent(nnx.Module):
 
         # The imagination starts from the posterior state of each replay step.
         starts = jax.tree.map(lambda x: x.reshape(B * T, *x.shape[2:]), states)
-        ac_losses, _, ac_metrics = imagination_loss(
+        ac_losses, imagined_returns, ac_metrics = imagination_loss(
             self.world_model,
             self.actor,
             self.critic,
@@ -162,7 +164,22 @@ class Agent(nnx.Module):
             slow_reg=c.slow_reg,
         )
 
-        losses = {**wm_losses, **ac_losses}
+        # The critic also learns the returns of the replay sequences. The
+        # imagined return from each replay step is the bootstrap value.
+        repval_loss, _ = replay_value_loss(
+            self.critic,
+            self.slow_critic,
+            states.features(),
+            batch["reward"],
+            batch["is_last"],
+            batch["is_terminal"],
+            imagined_returns[:, 0].reshape(B, T),
+            horizon=c.horizon,
+            lam=c.lam,
+            slow_reg=c.slow_reg,
+        )
+
+        losses = {**wm_losses, **ac_losses, "repval": repval_loss}
         scales = {
             "dyn": c.dyn_scale,
             "rep": c.rep_scale,
@@ -171,6 +188,7 @@ class Agent(nnx.Module):
             "con": c.con_scale,
             "policy": c.policy_scale,
             "value": c.value_scale,
+            "repval": c.repval_scale,
         }
         total = sum(scales[name] * loss.mean() for name, loss in losses.items())
         metrics = {f"loss/{name}": loss.mean() for name, loss in losses.items()}

@@ -289,3 +289,54 @@ def imagination_loss(
         "imagined_discount": discount.mean(),
     }
     return losses, returns, metrics
+
+
+def replay_value_loss(
+    critic: TwoHotHead,
+    slow_critic: TwoHotHead,
+    features: jax.Array,
+    reward: jax.Array,
+    is_last: jax.Array,
+    is_terminal: jax.Array,
+    bootstrap: jax.Array,
+    *,
+    horizon: float = 333,
+    lam: float = 0.95,
+    slow_reg: float = 1.0,
+) -> tuple[jax.Array, jax.Array]:
+    """The critic loss on replay trajectories.
+
+    The critic also learns from the real rewards of the replay data, not only
+    from imagined rewards. The targets are λ-returns along the replay
+    sequences. Their bootstrap values are the imagined returns from the same
+    states, because the imagination looks further ahead than the critic.
+
+    - At the end of an episode, the return does not go into the next episode.
+      The return of the last step gets no weight.
+    - At a terminal step, the discount is zero, so the return stops.
+
+    The gradient of this loss also goes into the world model. Thus the model
+    states learn to hold the information that the critic needs.
+
+    Args:
+        critic: the critic that the loss trains.
+        slow_critic: the moving average of the critic.
+        features: the model features [B, T, F] of the replay steps.
+        reward, is_last, is_terminal: the replay data [B, T].
+        bootstrap: the imagined return from each replay step [B, T].
+
+    Returns:
+        The loss [B, T - 1] and the replay returns [B, T - 1].
+    """
+    is_last = is_last.astype(jnp.float32)
+    discount = (1 - is_terminal.astype(jnp.float32)) * (1 - 1 / horizon)
+    returns = lambda_return(reward, sg(bootstrap), discount, lam * (1 - is_last))
+    features = features[:, :-1]
+    loss = critic_loss(
+        critic(features),
+        returns,
+        slow_critic(features).mean(),
+        weight=1 - is_last[:, :-1],
+        slow_reg=slow_reg,
+    )
+    return loss, returns

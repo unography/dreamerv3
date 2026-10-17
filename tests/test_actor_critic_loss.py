@@ -11,6 +11,7 @@ from dreamer.actor_critic import (
     actor_loss,
     critic_loss,
     imagination_loss,
+    replay_value_loss,
 )
 from dreamer.distributions import Normal, TwoHot, symexp_bins, two_hot
 from dreamer.world_model import TwoHotHead, WorldModel
@@ -164,3 +165,54 @@ def test_imagination_loss_trains_the_actor_and_critic_but_not_the_world_model():
     assert norm(world_model_grads) == 0
     assert norm(actor_grads) > 0
     assert norm(critic_grads) > 0
+
+
+def replay_returns(reward, is_last, is_terminal, bootstrap, lam=0.95):
+    """The replay value loss and returns of one trajectory [T]."""
+    critic = TwoHotHead(4, units=8, layers=1, rngs=nnx.Rngs(0))
+    data = [jnp.asarray(x)[None] for x in (reward, is_last, is_terminal, bootstrap)]
+    features = jnp.zeros((1, len(reward), 4))
+    loss, returns = replay_value_loss(
+        critic, critic, features, *data, horizon=100, lam=lam
+    )
+    return loss[0], returns[0]
+
+
+def test_replay_returns_sum_the_real_rewards_and_bootstrap_at_the_end():
+    _, returns = replay_returns(
+        reward=[0.0, 1.0, 2.0, 3.0],
+        is_last=[False] * 4,
+        is_terminal=[False] * 4,
+        bootstrap=[0.0, 0.0, 0.0, 50.0],
+        lam=1.0,
+    )
+
+    np.testing.assert_allclose(
+        returns[0], 1 + 0.99 * 2 + 0.99**2 * 3 + 0.99**3 * 50, rtol=1e-6
+    )
+
+
+def test_replay_returns_do_not_go_into_the_next_episode():
+    # Step 2 is the last step of an episode, so the return of step 1 uses the
+    # imagined return of step 2 and not the rewards after it.
+    _, returns = replay_returns(
+        reward=[0.0, 1.0, 2.0, 100.0],
+        is_last=[False, False, True, False],
+        is_terminal=[False] * 4,
+        bootstrap=[0.0, 0.0, 10.0, 0.0],
+    )
+
+    np.testing.assert_allclose(returns[1], 2.0 + 0.99 * 10.0, rtol=1e-6)
+
+
+def test_replay_value_loss_gives_no_weight_to_the_last_step_of_an_episode():
+    loss, _ = replay_returns(
+        reward=[0.0, 1.0, 2.0, 3.0],
+        is_last=[False, True, False, False],
+        is_terminal=[False] * 4,
+        bootstrap=[1.0] * 4,
+    )
+
+    assert loss[1] == 0
+    assert loss[0] > 0
+    assert loss[2] > 0
