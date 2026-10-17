@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from dreamer.replay import Replay
+from dreamer.replay import Location, Replay
 
 
 def add_steps(replay, num_steps, episode_length=1000):
@@ -38,7 +38,7 @@ def test_sequences_are_consecutive_steps_of_one_environment():
     replay = Replay(capacity=100, num_envs=3, length=5)
     add_steps(replay, 20)
 
-    ids = replay.sample(batch_size=64)["id"]
+    ids = replay.sample(batch_size=64)[0]["id"]
 
     env, time = ids // 1000, ids % 1000
     assert (env == env[:, :1]).all()
@@ -49,7 +49,7 @@ def test_sampling_reaches_every_sequence():
     replay = Replay(capacity=100, num_envs=2, length=5)
     add_steps(replay, 10)
 
-    starts = {int(seq[0]) for seq in replay.sample(batch_size=1000)["id"]}
+    starts = {int(seq[0]) for seq in replay.sample(batch_size=1000)[0]["id"]}
 
     assert starts == {1000 * env + time for env in range(2) for time in range(6)}
 
@@ -59,7 +59,7 @@ def test_full_buffer_forgets_the_oldest_steps():
 
     add_steps(replay, 25)
 
-    times = replay.sample(batch_size=1000)["id"] % 1000
+    times = replay.sample(batch_size=1000)[0]["id"] % 1000
     assert times.min() == 15
     assert times.max() == 24
     assert len(replay) == 2 * 6
@@ -69,7 +69,7 @@ def test_each_sequence_starts_with_is_first():
     replay = Replay(capacity=100, num_envs=1, length=5)
     add_steps(replay, 30, episode_length=7)
 
-    batch = replay.sample(batch_size=200)
+    batch, _ = replay.sample(batch_size=200)
 
     assert batch["is_first"][:, 0].all()
     # The other steps keep their flags, so episode starts inside a sequence
@@ -84,8 +84,8 @@ def test_online_queue_gives_each_new_sequence_first():
     replay = Replay(capacity=100, num_envs=2, length=5, online=True)
     add_steps(replay, 10)
 
-    first = replay.sample(batch_size=3)["id"][:, 0]
-    second = replay.sample(batch_size=3)["id"][:, 0]
+    first = replay.sample(batch_size=3)[0]["id"][:, 0]
+    second = replay.sample(batch_size=3)[0]["id"][:, 0]
 
     # Each environment queued the sequences that start at time 0 and 5.
     assert first.tolist() == [0, 1000, 5]
@@ -97,7 +97,20 @@ def test_online_queue_gives_every_new_step_to_training():
     seen = set()
     for _ in range(20):
         add_steps(replay, 5)
-        seen.update(replay.sample(batch_size=4)["id"].flatten().tolist())
+        seen.update(replay.sample(batch_size=4)[0]["id"].flatten().tolist())
 
     all_steps = {1000 * env + time for env in range(2) for time in range(100)}
     assert seen == all_steps
+
+
+def test_update_writes_new_values_into_the_last_steps_of_the_sequences():
+    replay = Replay(capacity=100, num_envs=2, length=5)
+    add_steps(replay, 10)
+    location = Location(env=np.array([0, 1]), start=np.array([1, 3]))
+
+    replay.update(location, {"id": np.full((2, 4), -1)})
+
+    assert replay.data["id"][0, :10].tolist() == [0, 1, -1, -1, -1, -1, 6, 7, 8, 9]
+    assert replay.data["id"][1, :10].tolist() == (
+        [1000, 1001, 1002, 1003, -1, -1, -1, -1, 1008, 1009]
+    )

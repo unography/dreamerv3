@@ -127,10 +127,11 @@ def train(args: Args) -> None:
     agent = Agent(
         envs.obs_shapes, envs.action_size, args.agent, rngs=nnx.Rngs(args.seed)
     )
+    # With the replay context, each sequence has one more step at the start.
     replay = Replay(
         min(args.replay_size, args.steps),
         args.envs,
-        args.batch_length,
+        args.batch_length + int(args.agent.replay_context),
         args.seed,
         online=args.replay_online,
     )
@@ -151,16 +152,32 @@ def train(args: Args) -> None:
         key, policy_key = jax.random.split(key)
         action, policy_state = agent.policy(policy_state, obs, policy_key)
         action = np.asarray(action)
-        replay.add({**obs, "action": action})  # The action after the observation.
+        rssm_state = policy_state[0]
+        replay.add(
+            {
+                **obs,
+                "action": action,  # The action after the observation.
+                "deter": np.asarray(rssm_state.deter),
+                "stoch": np.asarray(rssm_state.stoch),
+            }
+        )
         episodes.add(obs)
         step += args.envs
 
         # Train on replay data, after the buffer has enough sequences.
         if len(replay) >= batch_steps:
+            new_states = []
             for _ in range(should_train(step)):
                 key, train_key = jax.random.split(key)
-                batch = replay.sample(args.batch_size)
-                train_metrics.append(agent.train(batch, train_key))
+                batch, location = replay.sample(args.batch_size)
+                metrics, states = agent.train(batch, train_key)
+                train_metrics.append(metrics)
+                new_states.append((location, states))
+            # The replay buffer keeps the new RSSM states for the replay
+            # context. The updates come after the training steps, so the GPU
+            # does not wait for each step.
+            for location, states in new_states:
+                replay.update(location, {"deter": states.deter, "stoch": states.stoch})
 
         if step - last_log >= args.log_every:
             fps = (step - last_log) / (time.time() - last_time)

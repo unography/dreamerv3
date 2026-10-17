@@ -22,6 +22,7 @@ class Config:
     units: int = 64  # The width of the encoder, decoder, and heads.
 
     # The world model.
+    replay_context: bool = True  # Start sequences from the stored RSSM state.
     unimix: float = 0.01
     free_nats: float = 1.0
     horizon: int = 333  # The discount factor is 1 - 1 / horizon.

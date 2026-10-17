@@ -1,5 +1,7 @@
 """The training step and the policy of the agent."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,6 +24,7 @@ def make_agent(config=SMALL):
 def replay_batch():
     """A batch of sequences in the format of `Replay.sample`."""
     rng = np.random.default_rng(0)
+    stoch = rng.integers(0, SMALL.classes, size=(B, T, SMALL.stoch))
     batch = {
         "position": rng.normal(size=(B, T, 3)).astype(np.float32),
         "velocity": rng.normal(size=(B, T, 2)).astype(np.float32),
@@ -30,6 +33,9 @@ def replay_batch():
         "is_first": np.zeros((B, T), bool),
         "is_last": np.zeros((B, T), bool),
         "is_terminal": np.zeros((B, T), bool),
+        # The RSSM states that the policy or the training stored.
+        "deter": rng.uniform(-1, 1, size=(B, T, SMALL.deter)).astype(np.float32),
+        "stoch": np.eye(SMALL.classes, dtype=np.float32)[stoch],
     }
     batch["is_first"][:, 0] = True
     return batch
@@ -40,7 +46,7 @@ def copy_of_weights(module):
 
 
 def test_train_step_gives_finite_metrics():
-    metrics = make_agent().train(replay_batch(), jax.random.key(1))
+    metrics, _ = make_agent().train(replay_batch(), jax.random.key(1))
 
     assert {"loss/rec", "loss/policy", "loss/value", "grad_norm"} <= set(metrics)
     assert all(jnp.isfinite(value) for value in metrics.values())
@@ -85,12 +91,49 @@ def test_train_steps_on_one_batch_lower_the_world_model_losses():
     batch = replay_batch()
 
     keys = jax.random.split(jax.random.key(1), 30)
-    first = agent.train(batch, keys[0])
+    first, _ = agent.train(batch, keys[0])
     for key in keys[1:]:
-        last = agent.train(batch, key)
+        last, _ = agent.train(batch, key)
 
     assert last["loss/rec"] < 0.8 * first["loss/rec"]
     assert last["loss/con"] < 0.8 * first["loss/con"]
+
+
+def test_train_gives_the_states_of_the_trained_steps():
+    _, states = make_agent().train(replay_batch(), jax.random.key(1))
+
+    # With the replay context, the first step of each sequence only gives the
+    # start state, so the training uses the other T - 1 steps.
+    assert states.deter.shape == (B, T - 1, SMALL.deter)
+    assert states.stoch.shape == (B, T - 1, SMALL.stoch, SMALL.classes)
+
+
+def train_metrics(batch, config=SMALL):
+    metrics, _ = make_agent(config).train(batch, jax.random.key(1))
+    return metrics
+
+
+def test_replay_context_uses_only_the_state_of_the_first_step():
+    batch = replay_batch()
+    other_obs = {**batch, "position": batch["position"].copy()}
+    other_obs["position"][:, 0] += 10.0
+    other_state = {**batch, "deter": batch["deter"].copy()}
+    other_state["deter"][:, 0] *= -1
+
+    metrics = train_metrics(batch)
+
+    assert train_metrics(other_obs)["loss/rec"] == metrics["loss/rec"]
+    assert train_metrics(other_state)["loss/rec"] != metrics["loss/rec"]
+
+
+def test_without_replay_context_sequences_start_from_the_initial_state():
+    config = dataclasses.replace(SMALL, replay_context=False)
+    batch = replay_batch()
+    other_state = {**batch, "deter": -batch["deter"]}
+
+    metrics = train_metrics(batch, config)
+
+    assert train_metrics(other_state, config)["loss/rec"] == metrics["loss/rec"]
 
 
 N = 3  # The number of environments.

@@ -15,6 +15,11 @@ One training step does these operations on a batch of replay sequences:
 In the environment, the agent acts with `policy`. The policy keeps the RSSM
 state of each environment, updates it with each observation, and samples an
 action from the actor.
+
+Replay context: the replay buffer also keeps the RSSM state of each step,
+first from the policy and then from each training step on the step. Thus a
+training sequence can start from the state of its first step, instead of from
+zero. See `Agent.split_context`.
 """
 
 import jax
@@ -113,37 +118,33 @@ class Agent(nnx.Module):
     # walks the graph of the agent in Python, which takes longer than a policy
     # step on the GPU.
     @nnx.jit(graph=False)
-    def train(self, batch: dict[str, jax.Array], key: jax.Array) -> dict:
+    def train(self, batch: dict[str, jax.Array], key: jax.Array) -> tuple[dict, State]:
         """Does one training step on a batch of sequences [B, T, ...].
 
         Returns:
-            The metrics of the step.
+            The metrics of the step, and the posterior states of the trained
+            steps. With the replay context, these are the last T - 1 steps.
+            The replay buffer keeps these states for the replay context.
         """
         grad_fn = nnx.grad(
             Agent.loss, argnums=nnx.DiffState(0, TRAINABLE), has_aux=True
         )
-        grads, metrics = grad_fn(self, batch, key)
+        grads, (metrics, states) = grad_fn(self, batch, key)
         updates = self.optimizer.update(self, grads)
         update_slow_critic(self.slow_critic, self.critic, self.config.slow_rate)
         metrics["grad_norm"] = optax.tree.norm(grads)
         metrics["update_norm"] = optax.tree.norm(updates)
-        return metrics
+        return metrics, states
 
     def loss(
         self, batch: dict[str, jax.Array], key: jax.Array
-    ) -> tuple[jax.Array, dict]:
-        """Gives the sum of all scaled losses, and the metrics."""
+    ) -> tuple[jax.Array, tuple[dict, State]]:
+        """Gives the sum of all scaled losses, the metrics, and the states."""
         c = self.config
         wm_key, imagine_key = jax.random.split(key)
+        start, prev_actions, batch = self.split_context(batch)
         B, T = batch["is_first"].shape
 
-        # Each step of the replay data holds the action after its observation.
-        # The world model needs the action before each observation.
-        actions = batch["action"]
-        prev_actions = jnp.concatenate(
-            [jnp.zeros_like(actions[:, :1]), actions[:, :-1]], 1
-        )
-        start = self.world_model.rssm.initial(B)
         wm_losses, states = self.world_model.loss(
             start, prev_actions, batch, wm_key, horizon=c.horizon, free_nats=c.free_nats
         )
@@ -193,4 +194,33 @@ class Agent(nnx.Module):
         total = sum(scales[name] * loss.mean() for name, loss in losses.items())
         metrics = {f"loss/{name}": loss.mean() for name, loss in losses.items()}
         metrics.update(ac_metrics)
-        return total, metrics
+        return total, (metrics, states)
+
+    def split_context(
+        self, batch: dict[str, jax.Array]
+    ) -> tuple[State, jax.Array, dict[str, jax.Array]]:
+        """Splits a replay batch into a start state, actions, and steps.
+
+        Each replay step holds the action after its observation. The world
+        model needs the action before each observation, so the actions move
+        by one step.
+
+        With the replay context, the first step of each sequence only gives
+        the start state: the state that the replay buffer keeps for this step.
+        Thus the training continues from the state of the last training or
+        the policy, and does not start the sequence from zero. Without the
+        replay context, each sequence starts from the initial state.
+
+        Returns:
+            The start state [B, ...], the previous actions [B, T', A], and the
+            steps [B, T', ...] to train on.
+        """
+        actions = batch["action"]
+        if self.config.replay_context:
+            start = State(batch["deter"][:, 0], batch["stoch"][:, 0])
+            steps = {key: value[:, 1:] for key, value in batch.items()}
+            return start, actions[:, :-1], steps
+        start = self.world_model.rssm.initial(actions.shape[0])
+        first_action = jnp.zeros_like(actions[:, :1])
+        prev_actions = jnp.concatenate([first_action, actions[:, :-1]], 1)
+        return start, prev_actions, batch

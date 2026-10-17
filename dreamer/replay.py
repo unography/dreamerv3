@@ -12,8 +12,16 @@ Reference: appendix "Experience replay" of the DreamerV3 paper.
 """
 
 import collections
+from typing import NamedTuple
 
 import numpy as np
+
+
+class Location(NamedTuple):
+    """Where the sampled sequences are: the environment and the first step."""
+
+    env: np.ndarray  # [B]
+    start: np.ndarray  # [B]
 
 
 class Replay:
@@ -72,8 +80,8 @@ class Replay:
             start = self.count - self.length
             self.queue.extend((env, start) for env in range(self.num_envs))
 
-    def sample(self, batch_size: int) -> dict[str, np.ndarray]:
-        """Gives a batch of sequences [B, T, ...]."""
+    def sample(self, batch_size: int) -> tuple[dict[str, np.ndarray], Location]:
+        """Gives a batch of sequences [B, T, ...] and their location."""
         assert len(self) > 0, "The buffer does not contain a full sequence."
         oldest = max(0, self.count - self.slots)
         queued = []
@@ -92,4 +100,17 @@ class Replay:
         # The model does not know the state before the sequence. Thus it starts
         # each sequence from the reset state, as at the start of an episode.
         batch["is_first"][:, 0] = True
-        return batch
+        return batch, Location(env, start)
+
+    def update(self, location: Location, values: dict[str, np.ndarray]) -> None:
+        """Writes values [B, T', ...] into the last T' steps of sampled sequences.
+
+        The training uses this to keep the newest RSSM state of each step.
+        Call it before the next `add`, because a new step can replace a
+        sampled step.
+        """
+        for key, value in values.items():
+            value = np.asarray(value)
+            first = location.start + self.length - value.shape[1]
+            slots = (first[:, None] + np.arange(value.shape[1])) % self.slots
+            self.data[key][location.env[:, None], slots] = value
